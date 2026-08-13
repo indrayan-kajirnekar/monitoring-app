@@ -14,6 +14,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
+import { useAuth } from "./AuthContext";
 
 const API     = process.env.REACT_APP_API_URL || "";
 // Poll every 30 s — server cache TTL is now 60 s, so one poll per two cycles
@@ -782,6 +783,8 @@ const EMPTY_FILTERS = {
 };
 
 export default function Dashboard({ onGoToServers, onGoToEmail }) {
+  const { permissions } = useAuth();
+
   const [servers,     setServers]     = useState([]);
   const [vms,         setVms]         = useState([]);
   const [hypervisors, setHypervisors] = useState([]);
@@ -790,8 +793,24 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   const [refreshing,  setRefreshing]  = useState(false);
   const [sending,     setSending]     = useState(false);
   const [sendMsg,     setSendMsg]     = useState("");
+  const [sendFmt,     setSendFmt]     = useState("both"); // "html" | "csv" | "both"
   const [error,       setError]       = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
+
+  // ── Permission guard — show a clear message before any API calls ──────────
+  if (permissions && permissions.dashboard_view === false) {
+    return (
+      <div className="rounded-xl bg-amber-50 border border-amber-200 p-8 text-center text-amber-800 text-sm max-w-lg mx-auto mt-16">
+        <svg className="w-10 h-10 mx-auto mb-3 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+          <path strokeLinecap="round" strokeLinejoin="round"
+                d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+        </svg>
+        <p className="font-bold text-base mb-1">Dashboard access not granted</p>
+        <p className="text-amber-700">Your account does not have the <strong>dashboard_view</strong> permission.<br/>
+        Ask an Administrator to add you to a group with dashboard access (e.g. <em>Team</em> or <em>Leads</em>).</p>
+      </div>
+    );
+  }
 
   // ── Centralized reactive filter state (Req 2) ─────────────────────────────
   const [filters,    setFilters]     = useState(EMPTY_FILTERS);
@@ -830,8 +849,16 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
       setHypervisors(hRes.data);
       setLastUpdated(new Date().toLocaleTimeString());
       setError(null);
-    } catch {
-      setError("Unable to reach the API. Retrying…");
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 403) {
+        setError("Permission denied — your account needs the 'dashboard_view' permission. Ask an Administrator to assign you to a group (e.g. Team, Leads, or Administrator).");
+      } else if (status === 401) {
+        // axios interceptor in AuthContext will clear token and redirect to login
+        setError("Session expired. Please log in again.");
+      } else {
+        setError("Unable to reach the API. Retrying…");
+      }
     } finally {
       setLoading(false);
       setFetching(false);
@@ -905,9 +932,19 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
 
   // ── Error state (no servers loaded yet) ───────────────────────────────────
   if (error && servers.length === 0) {
+    const isPermError = error.startsWith("Permission denied");
     return (
-      <div className="rounded-xl bg-red-50 border border-red-200 p-6 text-red-700 text-sm">
-        <strong>Connection error:</strong> {error}
+      <div className={`rounded-xl border p-6 text-sm ${
+        isPermError
+          ? "bg-amber-50 border-amber-200 text-amber-800"
+          : "bg-red-50 border-red-200 text-red-700"
+      }`}>
+        <strong>{isPermError ? "Access denied:" : "Connection error:"}</strong> {error}
+        {isPermError && (
+          <p className="mt-3 text-xs text-amber-600">
+            Sign in as <strong>root</strong> → go to <strong>Users &amp; Groups</strong> → edit this user → assign the <strong>Team</strong>, <strong>Leads</strong>, or <strong>Administrator</strong> group.
+          </p>
+        )}
       </div>
     );
   }
@@ -1003,36 +1040,51 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
             {refreshing ? "Refreshing…" : "Refresh Now"}
           </button>
 
-          {/* Send Report */}
-          <button
-            disabled={sending || servers.length === 0}
-            onClick={async () => {
-              setSending(true); setSendMsg("");
-              try {
-                const res = await axios.post(`${API}/api/email/send-report`, {});
-                setSendMsg(`✓ ${res.data.message}`);
-              } catch (e) {
-                const detail = e.response?.data?.detail || "Send failed. Check Email Reports settings.";
-                setSendMsg(`⚠ ${detail}`);
-              } finally {
-                setSending(false);
-                setTimeout(() => setSendMsg(""), 7000);
-              }
-            }}
-            className="flex items-center gap-1.5 text-xs font-semibold
-              border border-slate-300 text-slate-600 px-3 py-1.5 rounded-lg
-              hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed">
-            {sending
-              ? <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
-                </svg>
-              : <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round"
-                        d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
-                </svg>}
-            {sending ? "Sending…" : "Send Report"}
-          </button>
+          {/* Send Report — split button with format selector */}
+          <div className="flex items-center rounded-lg border border-slate-300 overflow-hidden divide-x divide-slate-300">
+            {/* Main action button */}
+            <button
+              disabled={sending || servers.length === 0}
+              onClick={async () => {
+                setSending(true); setSendMsg("");
+                try {
+                  const res = await axios.post(`${API}/api/email/send-report`,
+                    { report_format: sendFmt });
+                  setSendMsg(`✓ ${res.data.message}`);
+                } catch (e) {
+                  const detail = e.response?.data?.detail || "Send failed. Check Email Reports settings.";
+                  setSendMsg(`⚠ ${detail}`);
+                } finally {
+                  setSending(false);
+                  setTimeout(() => setSendMsg(""), 7000);
+                }
+              }}
+              className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 px-3 py-1.5
+                hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed bg-white">
+              {sending
+                ? <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+                  </svg>
+                : <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round"
+                          d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                  </svg>}
+              {sending ? "Sending…" : "Send Report"}
+            </button>
+            {/* Format picker */}
+            <select
+              disabled={sending || servers.length === 0}
+              value={sendFmt}
+              onChange={e => setSendFmt(e.target.value)}
+              title="Select report format"
+              className="text-xs text-slate-500 bg-white px-2 py-1.5 appearance-none
+                focus:outline-none hover:bg-slate-50 disabled:opacity-40 cursor-pointer">
+              <option value="both">HTML+CSV</option>
+              <option value="html">HTML only</option>
+              <option value="csv">CSV only</option>
+            </select>
+          </div>
 
           {onGoToEmail && (
             <button onClick={onGoToEmail}

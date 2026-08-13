@@ -312,7 +312,8 @@ class VMMetadataBulkItem(BaseModel):
 
 class SendReportRequest(BaseModel):
     """Optional override — leave blank to use saved config."""
-    server_id: Optional[str] = None   # None = all enabled servers
+    server_id:     Optional[str] = None   # None = all enabled servers
+    report_format: str           = "both" # "html" | "csv" | "both"
 
 
 # ── Req 3 — Snapshot + Event Pydantic schemas ─────────────────────────────────
@@ -1423,6 +1424,7 @@ async def send_full_report(
             vm_idx += 1
 
     # ── Send ──────────────────────────────────────────────────────────────
+    fmt = payload.report_format if payload.report_format in ("html", "csv", "both") else "both"
     try:
         await loop.run_in_executor(
             None,
@@ -1437,6 +1439,7 @@ async def send_full_report(
                 recipients=recipients,
                 servers=servers_data,
                 vms=vms_data,
+                report_format=fmt,
             ),
         )
     except Exception as exc:
@@ -1447,7 +1450,8 @@ async def send_full_report(
         "recipients": recipients,
         "servers":    len(servers_data),
         "vms":        len(vms_data),
-        "message":    f"Report sent to {len(recipients)} recipient(s) with {len(servers_data)} host(s) and {len(vms_data)} VM(s).",
+        "format":     fmt,
+        "message":    f"Report sent to {len(recipients)} recipient(s) ({fmt} format) with {len(servers_data)} host(s) and {len(vms_data)} VM(s).",
     }
 
 
@@ -1589,6 +1593,72 @@ async def download_server_vms_csv(server_id: str,
     from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
     return _csv_response(_build_vm_csv(vms_data, sname), f"vms_{sname}_{ts}.csv")
+
+
+@app.get("/api/reports/report.html", tags=["CSV Downloads"],
+         dependencies=[Depends(_auth.require_perm("dashboard_view"))])
+async def download_html_report(db: AsyncSession = Depends(get_db)):
+    """
+    Download the full HTML report as a standalone file.
+    Uses the same data pipeline as /api/email/send-report.
+    """
+    from mailer import build_html_report
+    import asyncio, concurrent.futures
+
+    q = select(models.ServerConfig).where(models.ServerConfig.enabled == True)
+    rows = (await db.execute(q)).scalars().all()
+    if not rows:
+        raise HTTPException(404, "No enabled servers found.")
+
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(rows), 1)) as pool:
+        futures = [loop.run_in_executor(pool, _fetch_live_metrics, r) for r in rows]
+        all_metrics = await asyncio.gather(*futures)
+
+    meta_result = await db.execute(select(models.VMMetadata))
+    static_map  = {m.vm_name: m for m in meta_result.scalars().all()}
+
+    servers_data, vms_data = [], []
+    today  = date.today()
+    vm_idx = 0
+    for m in all_metrics:
+        servers_data.append({k: m[k] for k in (
+            "server_id", "display_name", "ip_address", "hypervisor_type",
+            "cpu_usage_pct", "cpu_cores", "ram_used_gb", "ram_total_gb",
+            "ram_usage_pct", "storage_used_tb", "storage_total_tb",
+            "storage_usage_pct", "vm_count", "status",
+        )})
+        for vm in m.get("vms", []):
+            meta      = static_map.get(vm["vm_name"])
+            ram_total = float(vm.get("ram_total_gb", 0))
+            ram_used  = float(vm.get("ram_used_gb",  0))
+            vms_data.append({
+                "vm_name":        vm["vm_name"],
+                "ip_address":     vm.get("ip_address", ""),
+                "hypervisor_type": m["hypervisor_type"],
+                "host_server_id": m["server_id"],
+                "power_state":    vm.get("power_state", ""),
+                "cpu_usage_pct":  float(vm.get("cpu_pct", 0)),
+                "cpu_cores":      int(vm.get("cpu_cores", 1)),
+                "ram_used_gb":    ram_used,
+                "ram_total_gb":   ram_total,
+                "ram_usage_pct":  round(ram_used / max(ram_total, 0.1) * 100, 1),
+                "owner_name":     meta.owner_name if meta else OWNERS[vm_idx % len(OWNERS)],
+                "creation_date":  meta.creation_date.isoformat() if meta
+                                  else (today - timedelta(days=vm_idx * 30)).isoformat(),
+                "purpose":        meta.purpose if meta else PURPOSES[vm_idx % len(PURPOSES)],
+                "status":         "stopped" if vm.get("power_state") == "stopped" else "online",
+            })
+            vm_idx += 1
+
+    html_bytes = build_html_report(servers_data, vms_data)
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+    return StreamingResponse(
+        iter([html_bytes]),
+        media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="hypermonitor_report_{ts}.html"'},
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
