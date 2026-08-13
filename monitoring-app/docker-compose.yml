@@ -1,0 +1,93 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — HyperMonitor stack
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Services
+# ────────
+#   db        PostgreSQL 16 — persistent store for VM metadata + server configs
+#   backend   FastAPI (uvicorn) — metrics API + server management CRUD
+#   frontend  React (Nginx) — dashboard + "Manage Servers" UI
+#
+# Quick start:
+#   docker compose up --build
+#
+# Dashboard:   http://<HOST_IP>:3000
+# API / Docs:  http://<HOST_IP>:8000/docs
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: hypermonitor_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     monitor
+      POSTGRES_PASSWORD: monitor
+      POSTGRES_DB:       monitordb
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d monitordb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI backend ───────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hypermonitor_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:    postgresql+asyncpg://monitor:monitor@db:5432/monitordb
+      SQLALCHEMY_ECHO: "false"
+      # Change this in production! Used to AES-encrypt stored credentials.
+      SECRET_KEY:      "hypermonitor-change-this-in-production"
+      # Change this in production! HS256 key for signing JWT access tokens.
+      JWT_SECRET:      "hypermonitor-jwt-secret-change-in-production"
+      # Token lifetime in hours (default 12).  Increase for convenience,
+      # decrease for stricter security.
+      JWT_EXPIRE_HOURS: "12"
+      # ── SMTP defaults (optional — can also be set via the UI) ────────────
+      # The actual config is stored in PostgreSQL via PUT /api/email/config.
+      # SMTP_HOST:     "smtp.gmail.com"
+      # SMTP_PORT:     "587"
+      # SMTP_USER:     "alerts@yourcompany.com"
+      # SMTP_PASSWORD: "your-app-password"
+    # workers=1 is required: the metrics cache is an in-memory dict; multiple
+    # workers would each have their own private copy (divergent state + 3x
+    # redundant hypervisor polls). Single worker + async concurrency is optimal.
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    ports:
+      - "0.0.0.0:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── React + Nginx frontend ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: hypermonitor_frontend
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+    driver: local

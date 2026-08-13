@@ -1,0 +1,24 @@
+Act as a Senior Software Architect and Principal Engineer. My multi-hypervisor monitoring tool (Dockerized with Docker Compose) is 50% complete. Before finishing the features, I need to refactor the existing codebase and design the new components to be highly flexible, decoupled, and scalable. 
+
+Please provide architectural patterns, backend code templates, and frontend strategies that satisfy the four core requirements using a modular plug-and-play design:
+
+1. ARCHITECTURAL PATTERN FOR HYPERVISORS (The Strategy Pattern)
+- Do not write separate, hardcoded endpoints or UI tables for Hyper-V, KVM, and ESXi.
+- Define a unified backend 'HypervisorInterface' or abstract base class with standardized methods like `get_all_vms()`, `get_vm_snapshots()`, and `get_server_status()`.
+- Show how to implement this interface for ESXi (vSphere SDK), KVM (libvirt), and Hyper-V (WMI/PowerShell via WinRM) so adding a 4th hypervisor (like Nutanix or Proxmox) in the future requires zero changes to the core application logic.
+
+2. DYNAMIC INVENTORY & COMPOSABLE FILTERING (Frontend & Backend)
+- Backend: Provide a generic, dynamic filtering API endpoint. It should accept optional query parameters (`?hypervisor_type=X&server_id=Y`) and dynamically build the query database/API without nested, fragile if/else statements.
+- Frontend: Create a highly reusable, state-driven Inventory Dashboard. Show how to bind Level 1 (Hypervisor) and Level 2 (Server) dropdowns to a centralized reactive state object so filtering stays fast and declarative.
+
+3. UNIFIED DATA MODELS FOR SNAPSHOTS & EVENTS
+- Provide a normalized database schema or JSON schema wrapper that standardizes mismatched data fields from different hypervisors into a single format.
+- Snapshots: Standardize fields for Name, Created At (ISO timestamp), and Allocated Size (normalized to Bytes).
+- Events: Design an extensible Event Schema capable of handling unexpected event attributes using a key-value 'Metadata' column or JSONB field.
+
+4. EXTENSIBLE BUILDER PATTERN FOR GLOBAL SEARCH
+- Fix the broken search functionality by implementing a clean Builder Pattern or dynamic query builder on the backend.
+- The search execution must automatically detect if the input string is an IP address, text string (Name/Owner), or server ID, and apply an 'OR' condition across those fields.
+- Ensure this search criteria merges flawlessly with the active state of the Hypervisor and Server drop-down filters.
+
+Provide the response focusing heavily on clean code principles, abstract layers, and separation of concerns so my 50% complete application becomes fully adaptable.
