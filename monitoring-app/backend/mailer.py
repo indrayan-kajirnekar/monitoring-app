@@ -167,7 +167,7 @@ def _build_vm_csv(vms: List[Dict], server_name: str) -> bytes:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# HTML email body
+# HTML report builder  (used by both email and the download endpoint)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _status_colour(status: str) -> str:
@@ -274,6 +274,19 @@ def _build_html_body(servers: List[Dict], vms: List[Dict], generated_at: str) ->
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Public helper — build the HTML report as raw bytes (used by download endpoint)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_html_report(servers: List[Dict], vms: List[Dict]) -> bytes:
+    """
+    Return the full HTML report as UTF-8 bytes.
+    Used by GET /api/reports/report.html for direct browser download.
+    """
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return _build_html_body(servers, vms, generated_at).encode("utf-8")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # SMTP send
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -287,21 +300,29 @@ def send_report(
     recipients: List[str],
     servers: List[Dict],
     vms: List[Dict],
-    smtp_mode: Optional[str] = None,   # "smtps" | "starttls" | "plain"
+    smtp_mode: Optional[str] = None,    # "smtps" | "starttls" | "plain"
+    report_format: str = "both",        # "html" | "csv" | "both"
 ) -> None:
     """
-    Build the full report and deliver it via SMTP.
+    Build the report in the requested format and deliver it via SMTP.
+
+    report_format values:
+      "html"  — email body is the rich HTML report; no CSV attachments
+      "csv"   — plain-text email with only CSV file attachments; no HTML body
+      "both"  — HTML body + all CSV attachments (default / original behaviour)
 
     smtp_mode values:
       "smtps"    — SSL/TLS from the start (port 465)
-      "starttls" — Plain connect + STARTTLS upgrade (port 587)
+      "starttls" — Plain TCP connect then STARTTLS upgrade (port 587)
       "plain"    — No encryption; suitable for internal port-25 relays
-    Raises on any connection or authentication failure.
     """
     if not recipients:
         raise ValueError("No recipients configured.")
     if not smtp_host:
         raise ValueError("SMTP host is not configured.")
+
+    # Normalise — default to "both" for any unrecognised value
+    fmt = report_format if report_format in ("html", "csv", "both") else "both"
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     subject = f"HyperMonitor Report — {generated_at}"
@@ -312,35 +333,48 @@ def send_report(
     msg["From"]    = from_address or smtp_user
     msg["To"]      = ", ".join(recipients)
 
-    # HTML body
-    html_body = _build_html_body(servers, vms, generated_at)
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    # ── Attach HTML body (html or both) ──────────────────────────────────────
+    if fmt in ("html", "both"):
+        html_body = _build_html_body(servers, vms, generated_at)
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+    else:
+        # CSV-only — add a minimal plain-text body so the email isn't empty
+        plain = (
+            f"HyperMonitor Infrastructure Report\n"
+            f"Generated: {generated_at}\n\n"
+            f"Hosts monitored: {len(servers)}\n"
+            f"Total VMs: {len(vms)}\n\n"
+            f"Full data is in the attached CSV files."
+        )
+        msg.attach(MIMEText(plain, "plain", "utf-8"))
 
-    # Attachment 1: dashboard_summary.csv
-    dash_csv = _build_dashboard_csv(servers)
-    part = MIMEBase("application", "octet-stream")
-    part.set_payload(dash_csv)
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition",
-                    "attachment", filename="dashboard_summary.csv")
-    msg.attach(part)
+    # ── Attach CSV files (csv or both) ───────────────────────────────────────
+    if fmt in ("csv", "both"):
+        # Attachment 1: dashboard_summary.csv
+        dash_csv = _build_dashboard_csv(servers)
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(dash_csv)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition",
+                        "attachment", filename="dashboard_summary.csv")
+        msg.attach(part)
 
-    # Attachment 2+: per-server VM inventory CSVs
-    server_map = {s["server_id"]: s["display_name"] for s in servers}
-    vms_by_server: Dict[str, List[Dict]] = defaultdict(list)
-    for v in vms:
-        vms_by_server[v.get("host_server_id", "unknown")].append(v)
+        # Attachment 2+: per-server VM inventory CSVs
+        server_map = {s["server_id"]: s["display_name"] for s in servers}
+        vms_by_server: Dict[str, List[Dict]] = defaultdict(list)
+        for v in vms:
+            vms_by_server[v.get("host_server_id", "unknown")].append(v)
 
-    for sid, vm_list in vms_by_server.items():
-        sname = re.sub(r"[^a-z0-9]+", "_",
-                       server_map.get(sid, sid).lower()).strip("_")[:40]
-        vm_csv = _build_vm_csv(vm_list, sname)
-        part2 = MIMEBase("application", "octet-stream")
-        part2.set_payload(vm_csv)
-        encoders.encode_base64(part2)
-        part2.add_header("Content-Disposition",
-                         "attachment", filename=f"vms_{sname}.csv")
-        msg.attach(part2)
+        for sid, vm_list in vms_by_server.items():
+            sname = re.sub(r"[^a-z0-9]+", "_",
+                           server_map.get(sid, sid).lower()).strip("_")[:40]
+            vm_csv = _build_vm_csv(vm_list, sname)
+            part2 = MIMEBase("application", "octet-stream")
+            part2.set_payload(vm_csv)
+            encoders.encode_base64(part2)
+            part2.add_header("Content-Disposition",
+                             "attachment", filename=f"vms_{sname}.csv")
+            msg.attach(part2)
 
     # ── Send ─────────────────────────────────────────────────────────────────
     #
@@ -357,7 +391,6 @@ def send_report(
     context = ssl.create_default_context()
 
     if mode == "smtps":
-        # SSL/TLS from the start (port 465)
         with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context,
                               timeout=30) as srv:
             if smtp_user and smtp_password:
@@ -365,7 +398,6 @@ def send_report(
             srv.sendmail(msg["From"], recipients, msg.as_string())
 
     elif mode == "starttls":
-        # Plain connect then STARTTLS upgrade (port 587)
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as srv:
             srv.ehlo()
             srv.starttls(context=context)
@@ -375,14 +407,11 @@ def send_report(
             srv.sendmail(msg["From"], recipients, msg.as_string())
 
     else:
-        # Plain SMTP — no encryption (port 25 corporate/internal relay)
-        # Common in data-centre environments where the relay is on the LAN.
-        # Only authenticates if credentials are explicitly provided.
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as srv:
             srv.ehlo()
             if smtp_user and smtp_password:
                 srv.login(smtp_user, smtp_password)
             srv.sendmail(msg["From"], recipients, msg.as_string())
 
-    log.info("Report sent to %s via %s:%s (mode=%s)",
-             recipients, smtp_host, smtp_port, mode)
+    log.info("Report sent to %s via %s:%s (mode=%s, format=%s)",
+             recipients, smtp_host, smtp_port, mode, fmt)

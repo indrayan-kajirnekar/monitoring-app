@@ -415,9 +415,32 @@ function ScheduleTab({ onBanner }) {
 
 // ── Tab 3: Send Now + CSV Downloads ──────────────────────────────────────────
 
+// Format option definitions — single source of truth
+const REPORT_FORMATS = [
+  {
+    value: "both",
+    label: "HTML + CSV",
+    desc:  "Inline HTML summary email with CSV attachments",
+    icon:  "📬",
+  },
+  {
+    value: "html",
+    label: "HTML only",
+    desc:  "Email contains only the inline HTML dashboard — no file attachments",
+    icon:  "📄",
+  },
+  {
+    value: "csv",
+    label: "CSV only",
+    desc:  "Plain-text email with CSV attachments — no HTML body",
+    icon:  "📎",
+  },
+];
+
 function SendNowTab({ onBanner }) {
   const [sending, setSending]   = useState(false);
   const [servers, setServers]   = useState([]);
+  const [fmt, setFmt]           = useState("both");   // "html" | "csv" | "both"
 
   useEffect(() => {
     axios.get(`${API}/api/servers/config`).then(r => setServers(r.data)).catch(() => {});
@@ -426,7 +449,7 @@ function SendNowTab({ onBanner }) {
   const sendReport = async () => {
     setSending(true);
     try {
-      const r = await axios.post(`${API}/api/email/send-report`, {});
+      const r = await axios.post(`${API}/api/email/send-report`, { report_format: fmt });
       onBanner(`✓ ${r.data.message}`, "ok");
     } catch (e) {
       onBanner(e.response?.data?.detail || "Send failed.", "error");
@@ -452,12 +475,36 @@ function SendNowTab({ onBanner }) {
             Collects live data from all enabled hosts and emails the report immediately to all configured recipients.
           </p>
         </div>
-        <div className="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 flex flex-col gap-1.5">
-          <span className="font-semibold text-slate-700">Every report contains:</span>
-          <span>📊 Inline HTML dashboard summary with KPI strip + server table</span>
-          <span>📎 <code>dashboard_summary.csv</code> — one row per hypervisor host</span>
-          <span>📎 <code>vms_&lt;hostname&gt;.csv</code> — full VM inventory per server</span>
+
+        {/* Format selector */}
+        <div>
+          <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Report Format</p>
+          <div className="flex flex-col gap-2">
+            {REPORT_FORMATS.map(f => (
+              <label key={f.value}
+                     className={`flex items-start gap-3 rounded-xl border px-4 py-3 cursor-pointer transition-colors
+                       ${fmt === f.value
+                         ? "border-slate-700 bg-slate-50"
+                         : "border-slate-200 bg-white hover:border-slate-300"}`}>
+                <input
+                  type="radio"
+                  name="report_format"
+                  value={f.value}
+                  checked={fmt === f.value}
+                  onChange={() => setFmt(f.value)}
+                  className="mt-0.5 accent-slate-700"
+                />
+                <span className="flex flex-col">
+                  <span className="flex items-center gap-1.5 text-sm font-semibold text-slate-800">
+                    <span>{f.icon}</span>{f.label}
+                  </span>
+                  <span className="text-xs text-slate-500 mt-0.5">{f.desc}</span>
+                </span>
+              </label>
+            ))}
+          </div>
         </div>
+
         <button disabled={sending} onClick={sendReport}
                 className="self-start flex items-center gap-2 px-6 py-2.5 rounded-xl text-sm font-semibold bg-slate-800 text-white hover:bg-slate-700 disabled:opacity-50">
           {sending ? <><Spinner /> Collecting &amp; sending…</> : <>
@@ -470,17 +517,22 @@ function SendNowTab({ onBanner }) {
         </button>
       </div>
 
-      {/* CSV downloads */}
+      {/* Downloads */}
       <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col gap-4">
         <div>
-          <h3 className="font-bold text-slate-800">Download CSV Reports</h3>
+          <h3 className="font-bold text-slate-800">Download Reports</h3>
           <p className="text-sm text-slate-500 mt-1">
-            Download current data as CSV files. Data is served from the 30 s cache — no additional hypervisor queries.
+            Download current data. Data is served from the 60 s cache — no additional hypervisor queries.
           </p>
         </div>
 
         <div className="flex flex-col gap-3">
-          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">All Servers</p>
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">HTML Report</p>
+          <div className="flex gap-3 flex-wrap">
+            {dlLink("/api/reports/report.html", "Full Dashboard Report (.html)", "📄")}
+          </div>
+
+          <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mt-1">CSV Reports — All Servers</p>
           <div className="flex gap-3 flex-wrap">
             {dlLink("/api/reports/servers.csv", "Dashboard Summary (all hosts)", "📊")}
             {dlLink("/api/reports/vms.csv", "VM Inventory (all hosts)", "🖥")}
@@ -488,7 +540,7 @@ function SendNowTab({ onBanner }) {
 
           {servers.filter(s => s.enabled).length > 0 && (
             <>
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mt-2">Per Server</p>
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mt-1">CSV Reports — Per Server</p>
               <div className="flex gap-3 flex-wrap">
                 {servers.filter(s => s.enabled).map(s => (
                   <a key={s.server_id}
