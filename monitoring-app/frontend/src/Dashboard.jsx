@@ -246,14 +246,24 @@ function SnapshotPanel({ vmId, vmName }) {
 // Per-server card  (selectable with checkbox for export)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ServerCard({ server, selected, onSelect }) {
+function ServerCard({ server, selected, onSelect, isFilterActive, onCardClick }) {
   const [showDrives, setShowDrives] = useState(false);
   const hasDrives = server.drives && server.drives.length > 0;
   const isStale   = server.cache_age_s != null && server.cache_age_s > 90;
 
   return (
-    <div className={`bg-white rounded-xl shadow-sm border p-5 flex flex-col gap-3
-      ${server.status === "critical" ? "border-red-300" : selected ? "border-blue-400 ring-1 ring-blue-300" : "border-slate-200"}`}>
+    <div
+      className={`bg-white rounded-xl shadow-sm border p-5 flex flex-col gap-3 cursor-pointer
+        ${server.status === "critical"
+          ? "border-red-300"
+          : isFilterActive
+            ? "border-blue-500 ring-2 ring-blue-400 bg-blue-50"
+            : selected
+              ? "border-blue-400 ring-1 ring-blue-300"
+              : "border-slate-200 hover:border-slate-300"}`}
+      onClick={onCardClick}
+      title={isFilterActive ? "Click to remove filter" : "Click to filter VMs by this server"}
+    >
 
       {/* Header row — checkbox + name + status */}
       <div className="flex items-start gap-2">
@@ -261,6 +271,7 @@ function ServerCard({ server, selected, onSelect }) {
         <input
           type="checkbox"
           checked={selected}
+          onClick={e => e.stopPropagation()}
           onChange={e => onSelect(server.server_id, e.target.checked)}
           className="mt-1 h-3.5 w-3.5 rounded border-slate-300 text-blue-600
             focus:ring-blue-400 cursor-pointer shrink-0"
@@ -269,6 +280,11 @@ function ServerCard({ server, selected, onSelect }) {
           <p className="font-semibold text-slate-800 text-sm truncate" title={server.display_name}>
             {server.display_name}
           </p>
+          {isFilterActive && (
+            <span className="inline-block text-[10px] font-semibold text-blue-600 bg-blue-100 border border-blue-200 rounded px-1.5 py-0.5 mt-0.5">
+              Active Filter
+            </span>
+          )}
           <p className="text-xs text-slate-400 font-mono">{server.ip_address}</p>
         </div>
         <div className="flex flex-col items-end gap-1">
@@ -317,7 +333,7 @@ function ServerCard({ server, selected, onSelect }) {
             Storage
             {hasDrives && (
               <button
-                onClick={() => setShowDrives(d => !d)}
+                onClick={e => { e.stopPropagation(); setShowDrives(d => !d); }}
                 className="text-blue-500 hover:text-blue-700 ml-1 text-[10px] font-semibold">
                 {showDrives ? "▲ hide" : `▼ ${server.drives.length} drive${server.drives.length > 1 ? "s" : ""}`}
               </button>
@@ -593,7 +609,7 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated }) {
                 Purpose
                 <span className="ml-1 text-slate-300">✎</span>
               </th>
-              <Th label="Status"     col="status" />
+              <Th label="Snapshots"  col="snapshot_count" />
               {/* Snapshots expand toggle */}
               <th className="px-3 py-3 w-20 text-xs font-semibold uppercase tracking-wider text-slate-500">
                 Snaps
@@ -678,8 +694,14 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated }) {
                     />
                   </td>
 
-                  <td className="px-3 py-2 whitespace-nowrap">
-                    <StatusDot status={vm.status} />
+                  <td className="px-3 py-2 whitespace-nowrap text-center">
+                    {vm.snapshot_count > 0 ? (
+                      <span className="inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                        {vm.snapshot_count} {vm.snapshot_count === 1 ? "snap" : "snaps"}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 font-normal">—</span>
+                    )}
                   </td>
 
                   {/* ── Snapshot toggle ───────────────────────────────────── */}
@@ -819,6 +841,24 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
       hypervisorType: hvType,
       serverId:       "",    // always reset Level 2 when Level 1 changes
     }));
+  };
+
+  // ── Select or toggle server filter from card click ────────────────────────
+  const handleServerCardClick = (server) => {
+    setFilters(f => {
+      if (f.serverId === server.server_id) {
+        return {
+          ...f,
+          serverId: "",
+        };
+      } else {
+        return {
+          ...f,
+          hypervisorType: server.hypervisor_type,
+          serverId:       server.server_id,
+        };
+      }
+    });
   };
 
   const fetchAll = useCallback(async (isBackground = false) => {
@@ -1284,8 +1324,7 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
           {servers
             .filter(s =>
-              (!filters.hypervisorType || s.hypervisor_type === filters.hypervisorType) &&
-              (!filters.serverId       || s.server_id       === filters.serverId)
+              (!filters.hypervisorType || s.hypervisor_type === filters.hypervisorType)
             )
             .map(s => (
               <ServerCard
@@ -1293,6 +1332,8 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
                 server={s}
                 selected={selectedIds.has(s.server_id)}
                 onSelect={toggleSelect}
+                isFilterActive={filters.serverId === s.server_id}
+                onCardClick={() => handleServerCardClick(s)}
               />
             ))}
         </div>
