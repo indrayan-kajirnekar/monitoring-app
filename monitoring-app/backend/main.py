@@ -1459,10 +1459,12 @@ async def send_full_report(
 # CSV Download endpoints
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _csv_response(content: bytes, filename: str) -> StreamingResponse:
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+def _xlsx_response(content: bytes, filename: str) -> StreamingResponse:
     return StreamingResponse(
         iter([content]),
-        media_type="text/csv",
+        media_type=_XLSX_MIME,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -1470,8 +1472,8 @@ def _csv_response(content: bytes, filename: str) -> StreamingResponse:
 @app.get("/api/reports/servers.csv", tags=["CSV Downloads"],
          dependencies=[Depends(_auth.require_perm("dashboard_view"))])
 async def download_servers_csv(db: AsyncSession = Depends(get_db)):
-    """Download dashboard summary as CSV (one row per host)."""
-    from mailer import _build_dashboard_csv
+    """Download infrastructure report as a formatted Excel workbook."""
+    from mailer import _build_xlsx
     result = await db.execute(
         select(models.ServerConfig).where(models.ServerConfig.enabled == True))
     rows = result.scalars().all()
@@ -1487,25 +1489,33 @@ async def download_servers_csv(db: AsyncSession = Depends(get_db)):
                 m = await loop.run_in_executor(pool, _fetch_live_metrics, row)
             metrics_cache.set_cached(row.server_id, m)
             all_metrics.append(m)
+    # Collect all VMs across all servers for the xlsx builder
+    all_vms: list = []
+    for m in all_metrics:
+        for vm in m.get("vms", []):
+            all_vms.append({**vm, "host_server_id": m["server_id"],
+                            "hypervisor_type": m["hypervisor_type"]})
     from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    return _csv_response(_build_dashboard_csv(all_metrics), f"servers_{ts}.csv")
+    return _xlsx_response(_build_xlsx(all_metrics, all_vms),
+                          f"hypermonitor_report_{ts}.xlsx")
 
 
 @app.get("/api/reports/vms.csv", tags=["CSV Downloads"],
          dependencies=[Depends(_auth.require_perm("dashboard_view"))])
 async def download_vms_csv(db: AsyncSession = Depends(get_db)):
-    """Download full VM inventory CSV (all hosts combined)."""
-    from mailer import _build_vm_csv
+    """Download full VM inventory as a formatted Excel workbook (all hosts)."""
+    from mailer import _build_xlsx
     result = await db.execute(
         select(models.ServerConfig).where(models.ServerConfig.enabled == True))
     rows = result.scalars().all()
     meta_result = await db.execute(select(models.VMMetadata))
     static_map = {m.vm_name: m for m in meta_result.scalars().all()}
 
-    all_vms = []
-    today   = date.today()
-    vm_idx  = 0
+    servers_data = []
+    all_vms      = []
+    today        = date.today()
+    vm_idx       = 0
     for row in rows:
         cached = metrics_cache.get_cached(row.server_id)
         if not cached:
@@ -1514,40 +1524,47 @@ async def download_vms_csv(db: AsyncSession = Depends(get_db)):
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 cached = await loop.run_in_executor(pool, _fetch_live_metrics, row)
             metrics_cache.set_cached(row.server_id, cached)
+        servers_data.append({k: cached[k] for k in (
+            "server_id", "display_name", "ip_address", "hypervisor_type",
+            "cpu_usage_pct", "cpu_cores", "ram_used_gb", "ram_total_gb",
+            "ram_usage_pct", "storage_used_tb", "storage_total_tb",
+            "storage_usage_pct", "vm_count", "status",
+        )})
         for vm in cached.get("vms", []):
             meta = static_map.get(vm["vm_name"])
             ram_total = float(vm.get("ram_total_gb", 0))
             ram_used  = float(vm.get("ram_used_gb",  0))
             all_vms.append({
-                "vm_name":       vm["vm_name"],
-                "ip_address":    vm.get("ip_address", ""),
+                "vm_name":        vm["vm_name"],
+                "ip_address":     vm.get("ip_address", ""),
                 "hypervisor_type": cached["hypervisor_type"],
                 "host_server_id": cached["server_id"],
-                "power_state":   vm.get("power_state", ""),
-                "cpu_usage_pct": float(vm.get("cpu_pct", 0)),
-                "cpu_cores":     int(vm.get("cpu_cores", 1)),
-                "ram_used_gb":   ram_used,
-                "ram_total_gb":  ram_total,
-                "ram_usage_pct": round(ram_used / max(ram_total, 0.1) * 100, 1),
-                "owner_name":    meta.owner_name if meta else OWNERS[vm_idx % len(OWNERS)],
-                "creation_date": meta.creation_date.isoformat() if meta
-                                 else (today - timedelta(days=vm_idx * 30)).isoformat(),
-                "purpose":       meta.purpose if meta else PURPOSES[vm_idx % len(PURPOSES)],
-                "status":        "stopped" if vm.get("power_state") == "stopped" else "online",
+                "power_state":    vm.get("power_state", ""),
+                "cpu_usage_pct":  float(vm.get("cpu_pct", 0)),
+                "cpu_cores":      int(vm.get("cpu_cores", 1)),
+                "ram_used_gb":    ram_used,
+                "ram_total_gb":   ram_total,
+                "ram_usage_pct":  round(ram_used / max(ram_total, 0.1) * 100, 1),
+                "owner_name":     meta.owner_name if meta else OWNERS[vm_idx % len(OWNERS)],
+                "creation_date":  meta.creation_date.isoformat() if meta
+                                  else (today - timedelta(days=vm_idx * 30)).isoformat(),
+                "purpose":        meta.purpose if meta else PURPOSES[vm_idx % len(PURPOSES)],
+                "status":         "stopped" if vm.get("power_state") == "stopped" else "online",
             })
             vm_idx += 1
 
     from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    return _csv_response(_build_vm_csv(all_vms, "all_hosts"), f"vms_all_{ts}.csv")
+    return _xlsx_response(_build_xlsx(servers_data, all_vms),
+                          f"hypermonitor_report_{ts}.xlsx")
 
 
 @app.get("/api/reports/vms/{server_id}.csv", tags=["CSV Downloads"],
          dependencies=[Depends(_auth.require_perm("dashboard_view"))])
 async def download_server_vms_csv(server_id: str,
                                    db: AsyncSession = Depends(get_db)):
-    """Download VM inventory CSV for a single host."""
-    from mailer import _build_vm_csv
+    """Download VM inventory for a single host as a formatted Excel workbook."""
+    from mailer import _build_xlsx
     result = await db.execute(
         select(models.ServerConfig).where(models.ServerConfig.server_id == server_id))
     row = result.scalars().first()
@@ -1565,6 +1582,12 @@ async def download_server_vms_csv(server_id: str,
     meta_result = await db.execute(select(models.VMMetadata))
     static_map = {m.vm_name: m for m in meta_result.scalars().all()}
 
+    server_data = [{k: cached[k] for k in (
+        "server_id", "display_name", "ip_address", "hypervisor_type",
+        "cpu_usage_pct", "cpu_cores", "ram_used_gb", "ram_total_gb",
+        "ram_usage_pct", "storage_used_tb", "storage_total_tb",
+        "storage_usage_pct", "vm_count", "status",
+    )}]
     vms_data = []
     today    = date.today()
     for i, vm in enumerate(cached.get("vms", [])):
@@ -1572,27 +1595,28 @@ async def download_server_vms_csv(server_id: str,
         ram_total = float(vm.get("ram_total_gb", 0))
         ram_used  = float(vm.get("ram_used_gb",  0))
         vms_data.append({
-            "vm_name":       vm["vm_name"],
-            "ip_address":    vm.get("ip_address", ""),
+            "vm_name":        vm["vm_name"],
+            "ip_address":     vm.get("ip_address", ""),
             "hypervisor_type": cached["hypervisor_type"],
             "host_server_id": server_id,
-            "power_state":   vm.get("power_state", ""),
-            "cpu_usage_pct": float(vm.get("cpu_pct", 0)),
-            "cpu_cores":     int(vm.get("cpu_cores", 1)),
-            "ram_used_gb":   ram_used,
-            "ram_total_gb":  ram_total,
-            "ram_usage_pct": round(ram_used / max(ram_total, 0.1) * 100, 1),
-            "owner_name":    meta.owner_name if meta else "",
-            "creation_date": meta.creation_date.isoformat() if meta
-                             else (today - timedelta(days=i * 30)).isoformat(),
-            "purpose":       meta.purpose if meta else "",
-            "status":        "stopped" if vm.get("power_state") == "stopped" else "online",
+            "power_state":    vm.get("power_state", ""),
+            "cpu_usage_pct":  float(vm.get("cpu_pct", 0)),
+            "cpu_cores":      int(vm.get("cpu_cores", 1)),
+            "ram_used_gb":    ram_used,
+            "ram_total_gb":   ram_total,
+            "ram_usage_pct":  round(ram_used / max(ram_total, 0.1) * 100, 1),
+            "owner_name":     meta.owner_name if meta else "",
+            "creation_date":  meta.creation_date.isoformat() if meta
+                              else (today - timedelta(days=i * 30)).isoformat(),
+            "purpose":        meta.purpose if meta else "",
+            "status":         "stopped" if vm.get("power_state") == "stopped" else "online",
         })
 
     sname = re.sub(r"[^a-z0-9]+", "_", row.display_name.lower()).strip("_")[:30]
     from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    return _csv_response(_build_vm_csv(vms_data, sname), f"vms_{sname}_{ts}.csv")
+    return _xlsx_response(_build_xlsx(server_data, vms_data),
+                          f"hypermonitor_{sname}_{ts}.xlsx")
 
 
 @app.get("/api/reports/report.html", tags=["CSV Downloads"],
