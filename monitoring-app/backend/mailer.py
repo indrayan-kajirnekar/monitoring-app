@@ -26,7 +26,6 @@ honoured: use_tls=True → "smtps", use_tls=False with no smtp_mode → "starttl
 
 from __future__ import annotations
 
-import csv
 import io
 import logging
 import re
@@ -40,130 +39,349 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
 
+from openpyxl import Workbook
+from openpyxl.styles import (
+    Alignment, Border, Font, PatternFill, Side
+)
+from openpyxl.utils import get_column_letter
+
 log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Presentation-quality CSV builders  (UTF-8 BOM so Excel opens correctly)
+# Shared openpyxl style helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_dashboard_csv(servers: List[Dict]) -> bytes:
-    """
-    Return a presentation-ready CSV for the dashboard summary.
-    Includes a KPI summary block at the top, then the per-host data table.
-    UTF-8 BOM so Microsoft Excel auto-detects encoding.
-    """
-    buf = io.StringIO()
+# Colour palette
+_C_HEADER_BG   = "0F172A"   # dark navy  — sheet title row
+_C_SECTION_BG  = "1E40AF"   # royal blue — section heading rows
+_C_COL_HDR_BG  = "DBEAFE"   # light blue — column header rows
+_C_COL_HDR_FG  = "1E3A5F"   # dark blue  — column header text
+_C_ALT_ROW     = "F0F7FF"   # faint blue — alternating data rows
+_C_CRITICAL    = "DC2626"   # red
+_C_WARNING     = "D97706"   # amber
+_C_ONLINE      = "16A34A"   # green
+_C_STOPPED     = "6B7280"   # grey
 
+_THIN = Side(style="thin", color="CBD5E1")
+_CELL_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+def _hdr_font(size: int = 11, bold: bool = True, color: str = "FFFFFF") -> Font:
+    return Font(name="Calibri", size=size, bold=bold, color=color)
+
+def _body_font(size: int = 10, bold: bool = False, color: str = "1F2328") -> Font:
+    return Font(name="Calibri", size=size, bold=bold, color=color)
+
+def _fill(hex_color: str) -> PatternFill:
+    return PatternFill(fill_type="solid", fgColor=hex_color)
+
+def _center() -> Alignment:
+    return Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+def _left() -> Alignment:
+    return Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+
+def _write_title_row(ws, text: str, ncols: int, row: int) -> None:
+    """Merge across all columns and write a big title row."""
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncols)
+    cell = ws.cell(row=row, column=1, value=text)
+    cell.font      = _hdr_font(size=13, color="FFFFFF")
+    cell.fill      = _fill(_C_HEADER_BG)
+    cell.alignment = _left()
+    cell.border    = _CELL_BORDER
+    ws.row_dimensions[row].height = 22
+
+
+def _write_section_heading(ws, text: str, ncols: int, row: int) -> None:
+    """Merge across all columns and write a blue section heading."""
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=ncols)
+    cell = ws.cell(row=row, column=1, value=text)
+    cell.font      = _hdr_font(size=11, color="FFFFFF")
+    cell.fill      = _fill(_C_SECTION_BG)
+    cell.alignment = _left()
+    cell.border    = _CELL_BORDER
+    ws.row_dimensions[row].height = 18
+
+
+def _write_col_headers(ws, headers: List[str], row: int) -> None:
+    """Write styled column header row."""
+    for col, text in enumerate(headers, start=1):
+        cell = ws.cell(row=row, column=col, value=text)
+        cell.font      = Font(name="Calibri", size=10, bold=True, color=_C_COL_HDR_FG)
+        cell.fill      = _fill(_C_COL_HDR_BG)
+        cell.alignment = _center()
+        cell.border    = _CELL_BORDER
+    ws.row_dimensions[row].height = 16
+
+
+def _write_data_row(ws, values: List, row: int, alt: bool = False,
+                    status_col: int | None = None) -> None:
+    """Write a styled data row; optionally colour the status cell."""
+    bg = _C_ALT_ROW if alt else "FFFFFF"
+    for col, val in enumerate(values, start=1):
+        cell = ws.cell(row=row, column=col, value=val)
+        cell.font      = _body_font()
+        cell.fill      = _fill(bg)
+        cell.alignment = _left()
+        cell.border    = _CELL_BORDER
+        # Colour the status column text
+        if status_col and col == status_col and isinstance(val, str):
+            v = val.lower()
+            if v in ("critical",):
+                cell.font = _body_font(bold=True, color=_C_CRITICAL)
+            elif v in ("warning",):
+                cell.font = _body_font(bold=True, color=_C_WARNING)
+            elif v in ("online", "running"):
+                cell.font = _body_font(bold=True, color=_C_ONLINE)
+            elif v in ("stopped", "offline"):
+                cell.font = _body_font(bold=True, color=_C_STOPPED)
+
+
+def _autofit(ws, min_width: int = 10, max_width: int = 40) -> None:
+    """Approximate column auto-fit based on cell content length."""
+    for col_cells in ws.columns:
+        length = max(
+            len(str(c.value)) if c.value is not None else 0
+            for c in col_cells
+        )
+        col_letter = get_column_letter(col_cells[0].column)
+        ws.column_dimensions[col_letter].width = min(max(length + 2, min_width), max_width)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Excel report builder  (one .xlsx with multiple sheets)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_xlsx(servers: List[Dict], vms: List[Dict]) -> bytes:
+    """
+    Build and return a fully-styled Excel workbook (.xlsx) as bytes.
+
+    Sheet layout:
+      • "Dashboard Summary"   — KPI block + host utilisation table
+      • One sheet per server  — VM inventory for that host
+    """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    total_vms     = sum(s.get("vm_count", 0) for s in servers)
-    critical_ct   = sum(1 for s in servers if s.get("status") == "critical")
-    warning_ct    = sum(1 for s in servers if s.get("status") == "warning")
-    avg_cpu       = (
+    wb  = Workbook()
+
+    # ── Sheet 1: Dashboard Summary ────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Dashboard Summary"
+    ws.sheet_view.showGridLines = False
+
+    total_vms   = sum(s.get("vm_count", 0) for s in servers)
+    running_vms = sum(1 for v in vms if v.get("power_state") == "running")
+    critical_ct = sum(1 for s in servers if s.get("status") == "critical")
+    warning_ct  = sum(1 for s in servers if s.get("status") == "warning")
+    avg_cpu     = (
         round(sum(s.get("cpu_usage_pct", 0) for s in servers) / len(servers), 1)
         if servers else 0
     )
 
-    # ── KPI summary block ─────────────────────────────────────────────────────
-    buf.write("HYPERMONITOR — INFRASTRUCTURE DASHBOARD REPORT\n")
-    buf.write(f"Generated: {now}\n")
-    buf.write("\n")
-    buf.write("EXECUTIVE SUMMARY\n")
-    buf.write(f"Total Hypervisor Hosts,{len(servers)}\n")
-    buf.write(f"Total Virtual Machines,{total_vms}\n")
-    buf.write(f"Average CPU Utilisation,{avg_cpu}%\n")
-    buf.write(f"Hosts in Critical State,{critical_ct}\n")
-    buf.write(f"Hosts in Warning State,{warning_ct}\n")
-    buf.write(f"Hosts Online,{len(servers) - critical_ct - warning_ct}\n")
-    buf.write("\n")
+    NCOLS_DASH = 13   # number of data columns in the host table
+    r = 1
 
-    # ── Per-host data table ───────────────────────────────────────────────────
-    buf.write("HOST UTILISATION DETAIL\n")
-    fields = [
-        "Display Name", "IP Address", "Hypervisor Type",
-        "CPU Usage %", "CPU Cores",
-        "RAM Used (GB)", "RAM Total (GB)", "RAM Usage %",
-        "Storage Used (TB)", "Storage Total (TB)", "Storage Usage %",
+    # Report title
+    _write_title_row(ws, "HyperMonitor — Infrastructure Dashboard Report", NCOLS_DASH, r)
+    r += 1
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NCOLS_DASH)
+    gen_cell = ws.cell(row=r, column=1, value=f"Generated: {now}")
+    gen_cell.font      = _body_font(size=10, color="57606A")
+    gen_cell.alignment = _left()
+    r += 2
+
+    # ── Executive Summary section ─────────────────────────────────────────────
+    _write_section_heading(ws, "Executive Summary", NCOLS_DASH, r); r += 1
+
+    kpi_labels = [
+        ("Total Hypervisor Hosts",  len(servers)),
+        ("Total Virtual Machines",  total_vms),
+        ("Running VMs",             running_vms),
+        ("Average CPU Utilisation", f"{avg_cpu}%"),
+        ("Hosts in Critical State", critical_ct),
+        ("Hosts in Warning State",  warning_ct),
+        ("Hosts Online",            len(servers) - critical_ct - warning_ct),
+    ]
+    for label, val in kpi_labels:
+        lbl_cell = ws.cell(row=r, column=1, value=label)
+        lbl_cell.font      = _body_font(bold=True)
+        lbl_cell.fill      = _fill("F8FAFC")
+        lbl_cell.alignment = _left()
+        lbl_cell.border    = _CELL_BORDER
+
+        val_cell = ws.cell(row=r, column=2, value=val)
+        val_cell.font      = _body_font(bold=True, color="1E40AF")
+        val_cell.fill      = _fill("F8FAFC")
+        val_cell.alignment = _center()
+        val_cell.border    = _CELL_BORDER
+
+        # Merge columns 3→NCOLS for the label row so it looks clean
+        ws.merge_cells(start_row=r, start_column=3,
+                       end_row=r, end_column=NCOLS_DASH)
+        ws.cell(row=r, column=3).fill   = _fill("F8FAFC")
+        ws.cell(row=r, column=3).border = _CELL_BORDER
+        r += 1
+
+    r += 1  # blank spacer
+
+    # ── Host Utilisation Detail section ──────────────────────────────────────
+    _write_section_heading(ws, "Host Utilisation Detail", NCOLS_DASH, r); r += 1
+
+    host_headers = [
+        "Host Name", "IP Address", "Hypervisor Type",
+        "CPU %", "CPU Cores",
+        "RAM Used (GB)", "RAM Total (GB)", "RAM %",
+        "Storage Used (TB)", "Storage Total (TB)", "Storage %",
         "VM Count", "Status",
     ]
-    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-    writer.writeheader()
-    for s in servers:
-        writer.writerow({
-            "Display Name":        s.get("display_name", ""),
-            "IP Address":          s.get("ip_address", ""),
-            "Hypervisor Type":     s.get("hypervisor_type", ""),
-            "CPU Usage %":         s.get("cpu_usage_pct", 0),
-            "CPU Cores":           s.get("cpu_cores", 0),
-            "RAM Used (GB)":       s.get("ram_used_gb", 0),
-            "RAM Total (GB)":      s.get("ram_total_gb", 0),
-            "RAM Usage %":         s.get("ram_usage_pct", 0),
-            "Storage Used (TB)":   s.get("storage_used_tb", 0),
-            "Storage Total (TB)":  s.get("storage_total_tb", 0),
-            "Storage Usage %":     s.get("storage_usage_pct", 0),
-            "VM Count":            s.get("vm_count", 0),
-            "Status":              s.get("status", "").upper(),
-        })
+    _write_col_headers(ws, host_headers, r); r += 1
 
-    # UTF-8 BOM prefix ensures correct encoding detection in Excel
-    return "\ufeff".encode("utf-8") + buf.getvalue().encode("utf-8")
+    for i, s in enumerate(servers):
+        _write_data_row(
+            ws,
+            [
+                s.get("display_name", ""),
+                s.get("ip_address", ""),
+                s.get("hypervisor_type", ""),
+                s.get("cpu_usage_pct", 0),
+                s.get("cpu_cores", 0),
+                s.get("ram_used_gb", 0),
+                s.get("ram_total_gb", 0),
+                s.get("ram_usage_pct", 0),
+                s.get("storage_used_tb", 0),
+                s.get("storage_total_tb", 0),
+                s.get("storage_usage_pct", 0),
+                s.get("vm_count", 0),
+                s.get("status", "").upper(),
+            ],
+            row=r,
+            alt=(i % 2 == 1),
+            status_col=13,   # "Status" is column 13
+        )
+        r += 1
 
+    # Fix column widths
+    ws.column_dimensions["A"].width = 20   # Host Name
+    ws.column_dimensions["B"].width = 16   # IP Address
+    ws.column_dimensions["C"].width = 18   # Hypervisor Type
+    for col in ["D","E","F","G","H","I","J","K","L"]:
+        ws.column_dimensions[col].width = 14
+    ws.column_dimensions["M"].width = 12   # Status
 
-def _build_vm_csv(vms: List[Dict], server_name: str) -> bytes:
-    """
-    Return a presentation-ready VM inventory CSV for a single host.
-    Includes a summary block + full inventory table.
-    UTF-8 BOM so Microsoft Excel auto-detects encoding.
-    """
-    buf = io.StringIO()
+    # Freeze panes below column headers so scrolling keeps headers visible
+    ws.freeze_panes = "A5"
 
-    now         = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    running_ct  = sum(1 for v in vms if v.get("power_state") == "running")
-    stopped_ct  = sum(1 for v in vms if v.get("power_state") == "stopped")
-    avg_cpu     = (
-        round(sum(v.get("cpu_usage_pct", 0) for v in vms) / len(vms), 1)
-        if vms else 0
-    )
-
-    # ── VM summary block ──────────────────────────────────────────────────────
-    buf.write(f"HYPERMONITOR — VM INVENTORY REPORT: {server_name.upper()}\n")
-    buf.write(f"Generated: {now}\n")
-    buf.write("\n")
-    buf.write("VM SUMMARY\n")
-    buf.write(f"Total VMs,{len(vms)}\n")
-    buf.write(f"Running,{running_ct}\n")
-    buf.write(f"Stopped,{stopped_ct}\n")
-    buf.write(f"Average CPU %,{avg_cpu}%\n")
-    buf.write("\n")
-
-    # ── VM inventory table ────────────────────────────────────────────────────
-    buf.write("VM INVENTORY DETAIL\n")
-    fields = [
-        "VM Name", "IP Address", "Hypervisor Type", "Power State",
-        "CPU Usage %", "vCPUs",
-        "RAM Used (GB)", "RAM Total (GB)", "RAM Usage %",
-        "Owner", "Creation Date", "Purpose", "Status",
-    ]
-    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-    writer.writeheader()
+    # ── Sheet per server: VM Inventory ────────────────────────────────────────
+    server_map: Dict[str, str] = {s["server_id"]: s["display_name"] for s in servers}
+    vms_by_server: Dict[str, List[Dict]] = defaultdict(list)
     for v in vms:
-        writer.writerow({
-            "VM Name":         v.get("vm_name", ""),
-            "IP Address":      v.get("ip_address", ""),
-            "Hypervisor Type": v.get("hypervisor_type", ""),
-            "Power State":     v.get("power_state", "").upper(),
-            "CPU Usage %":     v.get("cpu_usage_pct", 0),
-            "vCPUs":           v.get("cpu_cores", 0),
-            "RAM Used (GB)":   v.get("ram_used_gb", 0),
-            "RAM Total (GB)":  v.get("ram_total_gb", 0),
-            "RAM Usage %":     v.get("ram_usage_pct", 0),
-            "Owner":           v.get("owner_name", ""),
-            "Creation Date":   v.get("creation_date", ""),
-            "Purpose":         v.get("purpose", ""),
-            "Status":          v.get("status", "").upper(),
-        })
+        vms_by_server[v.get("host_server_id", "unknown")].append(v)
 
-    return "\ufeff".encode("utf-8") + buf.getvalue().encode("utf-8")
+    NCOLS_VM = 13
+
+    for sid, vm_list in vms_by_server.items():
+        sname_full  = server_map.get(sid, sid)
+        # Sheet names max 31 chars, no special chars
+        sheet_title = re.sub(r"[\\/*?:\[\]]", "_", sname_full)[:31]
+
+        ws2 = wb.create_sheet(title=sheet_title)
+        ws2.sheet_view.showGridLines = False
+
+        running_ct = sum(1 for v in vm_list if v.get("power_state") == "running")
+        stopped_ct = sum(1 for v in vm_list if v.get("power_state") == "stopped")
+        avg_cpu_vm = (
+            round(sum(v.get("cpu_usage_pct", 0) for v in vm_list) / len(vm_list), 1)
+            if vm_list else 0
+        )
+
+        r2 = 1
+        _write_title_row(ws2,
+                         f"HyperMonitor — VM Inventory: {sname_full}",
+                         NCOLS_VM, r2); r2 += 1
+
+        ws2.merge_cells(start_row=r2, start_column=1,
+                        end_row=r2, end_column=NCOLS_VM)
+        gc = ws2.cell(row=r2, column=1, value=f"Generated: {now}")
+        gc.font = _body_font(size=10, color="57606A"); gc.alignment = _left()
+        r2 += 2
+
+        # VM Summary block
+        _write_section_heading(ws2, "VM Summary", NCOLS_VM, r2); r2 += 1
+        vm_kpis = [
+            ("Total VMs",        len(vm_list)),
+            ("Running",          running_ct),
+            ("Stopped",          stopped_ct),
+            ("Average CPU %",    f"{avg_cpu_vm}%"),
+        ]
+        for label, val in vm_kpis:
+            lc = ws2.cell(row=r2, column=1, value=label)
+            lc.font = _body_font(bold=True); lc.fill = _fill("F8FAFC")
+            lc.alignment = _left(); lc.border = _CELL_BORDER
+
+            vc = ws2.cell(row=r2, column=2, value=val)
+            vc.font = _body_font(bold=True, color="1E40AF"); vc.fill = _fill("F8FAFC")
+            vc.alignment = _center(); vc.border = _CELL_BORDER
+
+            ws2.merge_cells(start_row=r2, start_column=3,
+                            end_row=r2, end_column=NCOLS_VM)
+            ws2.cell(row=r2, column=3).fill   = _fill("F8FAFC")
+            ws2.cell(row=r2, column=3).border = _CELL_BORDER
+            r2 += 1
+
+        r2 += 1
+
+        # VM Inventory table
+        _write_section_heading(ws2, "VM Inventory Detail", NCOLS_VM, r2); r2 += 1
+        vm_headers = [
+            "VM Name", "IP Address", "Hypervisor Type", "Power State",
+            "CPU %", "vCPUs",
+            "RAM Used (GB)", "RAM Total (GB)", "RAM %",
+            "Owner", "Creation Date", "Purpose", "Status",
+        ]
+        _write_col_headers(ws2, vm_headers, r2); r2 += 1
+
+        for i, v in enumerate(vm_list):
+            _write_data_row(
+                ws2,
+                [
+                    v.get("vm_name", ""),
+                    v.get("ip_address", ""),
+                    v.get("hypervisor_type", ""),
+                    v.get("power_state", "").upper(),
+                    v.get("cpu_usage_pct", 0),
+                    v.get("cpu_cores", 0),
+                    v.get("ram_used_gb", 0),
+                    v.get("ram_total_gb", 0),
+                    v.get("ram_usage_pct", 0),
+                    v.get("owner_name", ""),
+                    v.get("creation_date", ""),
+                    v.get("purpose", ""),
+                    v.get("status", "").upper(),
+                ],
+                row=r2,
+                alt=(i % 2 == 1),
+                status_col=13,  # "Status" is column 13
+            )
+            r2 += 1
+
+        # Column widths for VM sheet
+        ws2.column_dimensions["A"].width = 24  # VM Name
+        ws2.column_dimensions["B"].width = 16  # IP Address
+        ws2.column_dimensions["C"].width = 18  # Hypervisor Type
+        ws2.column_dimensions["D"].width = 12  # Power State
+        for col in ["E","F","G","H","I"]:
+            ws2.column_dimensions[col].width = 14
+        ws2.column_dimensions["J"].width = 16  # Owner
+        ws2.column_dimensions["K"].width = 14  # Creation Date
+        ws2.column_dimensions["L"].width = 20  # Purpose
+        ws2.column_dimensions["M"].width = 12  # Status
+
+        ws2.freeze_panes = "A5"
+
+    # Serialise to bytes
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -266,7 +484,7 @@ def _build_html_body(servers: List[Dict], vms: List[Dict], generated_at: str) ->
   </div>
 
   <div class="footer">
-    Full VM inventory CSVs (one per host) are attached to this email.<br>
+    A fully-formatted Excel workbook (hypermonitor_report.xlsx) is attached.<br>
     This report was sent automatically by HyperMonitor.
   </div>
 </div>
@@ -338,43 +556,29 @@ def send_report(
         html_body = _build_html_body(servers, vms, generated_at)
         msg.attach(MIMEText(html_body, "html", "utf-8"))
     else:
-        # CSV-only — add a minimal plain-text body so the email isn't empty
+        # xlsx-only — add a minimal plain-text body so the email isn't empty
         plain = (
             f"HyperMonitor Infrastructure Report\n"
             f"Generated: {generated_at}\n\n"
             f"Hosts monitored: {len(servers)}\n"
             f"Total VMs: {len(vms)}\n\n"
-            f"Full data is in the attached CSV files."
+            f"Full data is in the attached Excel report."
         )
         msg.attach(MIMEText(plain, "plain", "utf-8"))
 
-    # ── Attach CSV files (csv or both) ───────────────────────────────────────
+    # ── Attach Excel workbook (csv or both) ──────────────────────────────────
+    # A single .xlsx replaces the multiple CSV files — all sheets are included:
+    #   Sheet 1: Dashboard Summary (KPI block + host utilisation table)
+    #   Sheet N: VM inventory per host (one sheet per server)
     if fmt in ("csv", "both"):
-        # Attachment 1: dashboard_summary.csv
-        dash_csv = _build_dashboard_csv(servers)
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(dash_csv)
+        xlsx_bytes = _build_xlsx(servers, vms)
+        part = MIMEBase("application",
+                        "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        part.set_payload(xlsx_bytes)
         encoders.encode_base64(part)
         part.add_header("Content-Disposition",
-                        "attachment", filename="dashboard_summary.csv")
+                        "attachment", filename="hypermonitor_report.xlsx")
         msg.attach(part)
-
-        # Attachment 2+: per-server VM inventory CSVs
-        server_map = {s["server_id"]: s["display_name"] for s in servers}
-        vms_by_server: Dict[str, List[Dict]] = defaultdict(list)
-        for v in vms:
-            vms_by_server[v.get("host_server_id", "unknown")].append(v)
-
-        for sid, vm_list in vms_by_server.items():
-            sname = re.sub(r"[^a-z0-9]+", "_",
-                           server_map.get(sid, sid).lower()).strip("_")[:40]
-            vm_csv = _build_vm_csv(vm_list, sname)
-            part2 = MIMEBase("application", "octet-stream")
-            part2.set_payload(vm_csv)
-            encoders.encode_base64(part2)
-            part2.add_header("Content-Disposition",
-                             "attachment", filename=f"vms_{sname}.csv")
-            msg.attach(part2)
 
     # ── Send ─────────────────────────────────────────────────────────────────
     #
