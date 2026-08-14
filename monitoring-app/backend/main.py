@@ -243,6 +243,7 @@ class VMRecord(BaseModel):
     creation_date:   str
     purpose:         str
     status:          str
+    snapshot_count:  int = 0
 
 
 class HypervisorSummary(BaseModel):
@@ -765,6 +766,14 @@ async def get_vms(
         m.vm_name: m for m in meta_result.scalars().all()
     }
 
+    # Load snapshot counts grouped by vm_id in one query
+    from sqlalchemy import func as sa_func
+    snap_result = await db.execute(
+        select(models.VMSnapshot.vm_id, sa_func.count().label("cnt"))
+        .group_by(models.VMSnapshot.vm_id)
+    )
+    snapshot_counts: Dict[str, int] = {row.vm_id: row.cnt for row in snap_result.all()}
+
     out: List[VMRecord] = []
     today = date.today()
     vm_idx = 0
@@ -825,6 +834,7 @@ async def get_vms(
                 creation_date=created,
                 purpose=purpose,
                 status=_status,
+                snapshot_count=snapshot_counts.get(vm_id, 0),
             ))
             vm_idx += 1
 
