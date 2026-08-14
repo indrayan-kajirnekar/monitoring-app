@@ -797,21 +797,6 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   const [error,       setError]       = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
 
-  // ── Permission guard — show a clear message before any API calls ──────────
-  if (permissions && permissions.dashboard_view === false) {
-    return (
-      <div className="rounded-xl bg-amber-50 border border-amber-200 p-8 text-center text-amber-800 text-sm max-w-lg mx-auto mt-16">
-        <svg className="w-10 h-10 mx-auto mb-3 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          <path strokeLinecap="round" strokeLinejoin="round"
-                d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
-        </svg>
-        <p className="font-bold text-base mb-1">Dashboard access not granted</p>
-        <p className="text-amber-700">Your account does not have the <strong>dashboard_view</strong> permission.<br/>
-        Ask an Administrator to add you to a group with dashboard access (e.g. <em>Team</em> or <em>Leads</em>).</p>
-      </div>
-    );
-  }
-
   // ── Centralized reactive filter state (Req 2) ─────────────────────────────
   const [filters,    setFilters]     = useState(EMPTY_FILTERS);
 
@@ -870,6 +855,21 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     intervalRef.current = setInterval(() => fetchAll(true), POLL_MS);
     return () => clearInterval(intervalRef.current);
   }, [fetchAll]);
+
+  // ── Permission guard — show a clear message before any API calls ──────────
+  if (permissions && permissions.dashboard_view === false) {
+    return (
+      <div className="rounded-xl bg-amber-50 border border-amber-200 p-8 text-center text-amber-800 text-sm max-w-lg mx-auto mt-16">
+        <svg className="w-10 h-10 mx-auto mb-3 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+          <path strokeLinecap="round" strokeLinejoin="round"
+                d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+        </svg>
+        <p className="font-bold text-base mb-1">Dashboard access not granted</p>
+        <p className="text-amber-700">Your account does not have the <strong>dashboard_view</strong> permission.<br/>
+        Ask an Administrator to add you to a group with dashboard access (e.g. <em>Team</em> or <em>Leads</em>).</p>
+      </div>
+    );
+  }
 
   // ── Manual cache refresh ────────────────────────────────────────────────────
   const handleRefreshNow = async () => {
