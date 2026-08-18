@@ -633,8 +633,9 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [] }) {
     [vms, filters, sortKey, sortAsc]
   );
 
-  const running    = vms.filter(v => v.power_state === "running").length;
-  const stopped    = vms.filter(v => v.power_state === "stopped").length;
+  // Counts based on the filtered result so the header matches what's visible
+  const running    = displayed.filter(v => v.power_state === "running").length;
+  const stopped    = displayed.filter(v => v.power_state === "stopped").length;
   const dirtyCount = Object.keys(edits).length;
 
   const Th = ({ label, col }) => (
@@ -654,7 +655,7 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [] }) {
         <div className="flex items-center gap-3 flex-wrap">
           <h2 className="font-semibold text-slate-800">VM Inventory</h2>
           <span className="text-xs text-slate-400">
-            {running} running · {stopped} stopped · {vms.length} total
+            {running} running · {stopped} stopped · {displayed.length} of {vms.length} total
           </span>
           {/* Power state filter pills — write directly into centralized filters */}
           <div className="flex gap-1">
@@ -722,6 +723,34 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [] }) {
           </button>
         </div>
       </div>
+
+      {/* Active filter status banner — shows which server/hypervisor filter is active */}
+      {(filters.serverId || filters.hypervisorType) && (
+        <div className="px-5 py-2 bg-amber-50 border-b border-amber-200 flex items-center gap-2 text-xs text-amber-800">
+          <svg className="w-3.5 h-3.5 shrink-0 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707L13 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 017 21v-7.586L3.293 6.707A1 1 0 013 6V4z"/>
+          </svg>
+          <span>
+            Filtered by:
+            {filters.hypervisorType && (
+              <strong className="ml-1">{filters.hypervisorType}</strong>
+            )}
+            {filters.serverId && (
+              <strong className="ml-1">
+                {" — "}{servers.find(s => s.server_id === filters.serverId)?.display_name || filters.serverId}
+              </strong>
+            )}
+            <span className="ml-2 text-amber-600">
+              — showing {displayed.length} of {vms.length} VMs
+            </span>
+          </span>
+          <button
+            onClick={() => onFilters(f => ({ ...f, hypervisorType: "", serverId: "" }))}
+            className="ml-auto text-amber-600 hover:text-amber-900 underline font-semibold">
+            ✕ clear filter
+          </button>
+        </div>
+      )}
 
       {/* Inline-edit hint banner */}
       <div className="px-5 py-2 bg-blue-50 border-b border-blue-100 flex items-center gap-2 text-xs text-blue-700">
@@ -1003,15 +1032,19 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   const handleServerCardClick = (server) => {
     setFilters(f => {
       if (f.serverId === server.server_id) {
+        // Deselect: clear both server and hypervisor filters, keep search/power
         return {
           ...f,
-          serverId: "",
+          hypervisorType: "",
+          serverId:       "",
         };
       } else {
+        // Select: pin to this exact server, clear search to avoid stale interference
         return {
           ...f,
           hypervisorType: server.hypervisor_type,
           serverId:       server.server_id,
+          search:         "",
         };
       }
     });
