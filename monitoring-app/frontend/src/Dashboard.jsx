@@ -31,12 +31,17 @@ const POLL_MS = 30000;
 const _IP_RE   = /^(\d{1,3}\.){1,3}\d{0,3}$|^[\da-fA-F:]{2,39}$/;
 const _SLUG_RE = /^[a-z0-9]+-[a-z0-9-]+$/i;
 
-function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }) {
+function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }, selectedIds) {
   return vms.filter(vm => {
-    // Level 1 — hypervisor type
-    if (hypervisorType && vm.hypervisor_type !== hypervisorType) return false;
-    // Level 2 — specific server (cascades from Level 1)
-    if (serverId      && vm.host_server_id  !== serverId)       return false;
+    // If specific servers are selected in the Live Utilisation tab, filter strictly by those servers
+    if (selectedIds && selectedIds.size > 0) {
+      if (!selectedIds.has(vm.host_server_id)) return false;
+    } else {
+      // Level 1 — hypervisor type
+      if (hypervisorType && vm.hypervisor_type !== hypervisorType) return false;
+      // Level 2 — specific server (cascades from Level 1)
+      if (serverId      && vm.host_server_id  !== serverId)       return false;
+    }
     // Power state filter
     if (powerState && powerState !== "all" && vm.power_state !== powerState) return false;
 
@@ -451,7 +456,7 @@ function triggerCsvDownload(content, filename) {
  * onFilters   – setState setter for filters (used for search + power pill)
  * onVmsUpdated – callback after a successful inline metadata save
  */
-function VMTable({ vms, filters, onFilters, onVmsUpdated }) {
+function VMTable({ vms, filters, onFilters, onVmsUpdated, selectedIds, servers = [] }) {
   const [sortKey,  setSortKey]  = useState("vm_name");
   const [sortAsc,  setSortAsc]  = useState(true);
   // Which vm_ids have their snapshot panel expanded
@@ -506,13 +511,13 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated }) {
 
   // ── Apply centralized filters via applyVMFilters (Req 2 + 4) ────────────────
   const displayed = useMemo(() =>
-    applyVMFilters(vms, filters)
+    applyVMFilters(vms, filters, selectedIds)
       .sort((a, b) => {
         const av = a[sortKey], bv = b[sortKey];
         const cmp = typeof av === "number" ? av - bv : String(av).localeCompare(String(bv));
         return sortAsc ? cmp : -cmp;
       }),
-    [vms, filters, sortKey, sortAsc]
+    [vms, filters, selectedIds, sortKey, sortAsc]
   );
 
   const running    = vms.filter(v => v.power_state === "running").length;
@@ -627,6 +632,7 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated }) {
               </tr>
             ) : displayed.map(vm => {
               const dirty = isDirty(vm);
+              const hostServer = servers.find(s => s.server_id === vm.host_server_id);
               return (
                 <React.Fragment key={vm.vm_id}>
                 <tr
@@ -638,7 +644,14 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated }) {
                     {vm.ip_address || <span className="text-slate-300">—</span>}
                   </td>
                   <td className="px-3 py-2 whitespace-nowrap">
-                    <HypervisorBadge type={vm.hypervisor_type} />
+                    <div className="flex flex-col">
+                      <HypervisorBadge type={vm.hypervisor_type} />
+                      {hostServer && (
+                        <span className="text-[11px] text-slate-500 mt-0.5" title="Hosted on">
+                          {hostServer.display_name} ({hostServer.ip_address})
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="px-3 py-2 whitespace-nowrap">
                     <PowerBadge state={vm.power_state} />
@@ -1357,6 +1370,8 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
           filters={filters}
           onFilters={setFilters}
           onVmsUpdated={() => fetchAll(true)}
+          selectedIds={selectedIds}
+          servers={servers}
         />
       </section>
 
