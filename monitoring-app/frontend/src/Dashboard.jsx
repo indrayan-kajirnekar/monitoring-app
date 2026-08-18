@@ -31,21 +31,16 @@ const POLL_MS = 30000;
 const _IP_RE   = /^(\d{1,3}\.){1,3}\d{0,3}$|^[\da-fA-F:]{2,39}$/;
 const _SLUG_RE = /^[a-z0-9]+-[a-z0-9-]+$/i;
 
-function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }, selectedIds) {
+function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }) {
   return vms.filter(vm => {
-    // If specific servers are selected in the Live Utilisation tab, filter strictly by those servers
-    if (selectedIds && selectedIds.size > 0) {
-      if (!selectedIds.has(vm.host_server_id)) return false;
-    } else {
-      // Level 1 — hypervisor type
-      if (hypervisorType && vm.hypervisor_type !== hypervisorType) return false;
-      // Level 2 — specific server (cascades from Level 1)
-      if (serverId      && vm.host_server_id  !== serverId)       return false;
-    }
+    // Level 1 — hypervisor type
+    if (hypervisorType && vm.hypervisor_type !== hypervisorType) return false;
+    // Level 2 — specific server (cascades from Level 1)
+    if (serverId      && vm.host_server_id  !== serverId)       return false;
     // Power state filter
     if (powerState && powerState !== "all" && vm.power_state !== powerState) return false;
 
-    // Smart global search (Req 4 Builder Pattern)
+    // Smart global search — auto-detects IP / slug / free-text
     if (search) {
       const q = search.trim();
       if (!q) return true;
@@ -381,6 +376,9 @@ function buildPresentationCsv(servers, vms) {
     ? (servers.reduce((s, h) => s + h.cpu_usage_pct, 0) / servers.length).toFixed(1)
     : 0;
 
+  // Build a quick lookup: server_id → server object
+  const serverMap = Object.fromEntries(servers.map(s => [s.server_id, s]));
+
   const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const row = cols => cols.map(esc).join(",") + "\n";
 
@@ -415,22 +413,137 @@ function buildPresentationCsv(servers, vms) {
   }
   csv += "\n";
 
-  // ── VM inventory table ────────────────────────────────────────────────────
+  // ── VM inventory table — matches all columns shown in the VM Inventory UI ─
   csv += "VM INVENTORY DETAIL\n";
-  csv += row(["VM Name", "IP Address", "Hypervisor", "Power State",
-              "CPU %", "vCPUs", "RAM Used (GB)", "RAM Total (GB)", "RAM %",
-              "Owner", "Creation Date", "Purpose", "Status"]);
+  csv += row(["VM Name", "IP Address", "Hypervisor Type", "Host Server", "Host IP",
+              "Power State", "CPU %", "vCPUs", "RAM Used (GB)", "RAM Total (GB)", "RAM %",
+              "Snapshots", "Owner", "Creation Date", "Purpose", "Status"]);
   for (const v of vms) {
+    const host = serverMap[v.host_server_id];
     csv += row([v.vm_name, v.ip_address, v.hypervisor_type,
+                host ? host.display_name : v.host_server_id,
+                host ? host.ip_address : "",
                 (v.power_state || "").toUpperCase(),
                 v.cpu_usage_pct, v.cpu_cores,
                 v.ram_used_gb, v.ram_total_gb, v.ram_usage_pct,
+                v.snapshot_count ?? 0,
                 v.owner_name, v.creation_date, v.purpose,
                 (v.status || "").toUpperCase()]);
   }
 
   // UTF-8 BOM so Excel auto-detects encoding
   return "\uFEFF" + csv;
+}
+
+function buildPresentationHtml(servers, vms) {
+  const now = new Date().toUTCString();
+  const serverMap = Object.fromEntries(servers.map(s => [s.server_id, s]));
+  const runningVMs = vms.filter(v => v.power_state === "running").length;
+  const stoppedVMs = vms.filter(v => v.power_state === "stopped").length;
+
+  const esc = v => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  const powerColour = state => {
+    if (state === "running") return "color:#15803d;font-weight:600";
+    if (state === "stopped") return "color:#6b7280";
+    if (state === "paused")  return "color:#d97706;font-weight:600";
+    return "";
+  };
+
+  const vmRows = vms.map(v => {
+    const host = serverMap[v.host_server_id];
+    return `<tr>
+      <td>${esc(v.vm_name)}</td>
+      <td style="font-family:monospace">${esc(v.ip_address)}</td>
+      <td>${esc(v.hypervisor_type)}</td>
+      <td>${host ? esc(host.display_name) : esc(v.host_server_id)}<br/><span style="color:#9ca3af;font-size:11px">${host ? esc(host.ip_address) : ""}</span></td>
+      <td style="${powerColour(v.power_state)}">${esc((v.power_state || "").toUpperCase())}</td>
+      <td>${esc(v.cpu_usage_pct)}%</td>
+      <td>${esc(v.cpu_cores)}</td>
+      <td>${esc(v.ram_used_gb)} / ${esc(v.ram_total_gb)} GB<br/><span style="color:#9ca3af;font-size:11px">${esc(v.ram_usage_pct)}%</span></td>
+      <td>${esc(v.snapshot_count ?? 0)}</td>
+      <td>${esc(v.owner_name)}</td>
+      <td style="font-size:11px">${esc(v.creation_date)}</td>
+      <td>${esc(v.purpose)}</td>
+    </tr>`;
+  }).join("");
+
+  const serverRows = servers.map(s => `<tr>
+    <td>${esc(s.display_name)}</td>
+    <td style="font-family:monospace">${esc(s.ip_address)}</td>
+    <td>${esc(s.hypervisor_type)}</td>
+    <td>${esc(s.cpu_usage_pct)}%</td>
+    <td>${esc(s.cpu_cores)}</td>
+    <td>${esc(s.ram_used_gb)} / ${esc(s.ram_total_gb)} GB (${esc(s.ram_usage_pct)}%)</td>
+    <td>${esc(s.storage_used_tb)} / ${esc(s.storage_total_tb)} TB (${esc(s.storage_usage_pct)}%)</td>
+    <td>${esc(s.vm_count)}</td>
+    <td style="text-transform:uppercase">${esc(s.status)}</td>
+  </tr>`).join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>HyperMonitor Report</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; font-size:13px; color:#1f2328; margin:0; padding:24px; background:#f7f8fa }
+  h1 { font-size:20px; margin:0 0 4px } .sub { color:#6b7280; font-size:12px; margin-bottom:24px }
+  h2 { font-size:14px; font-weight:600; margin:28px 0 8px; color:#374151 }
+  .kpi { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:28px }
+  .kpi-card { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:12px 20px; min-width:140px }
+  .kpi-val { font-size:22px; font-weight:700; color:#1f2328 }
+  .kpi-lbl { font-size:11px; color:#6b7280; margin-top:2px }
+  table { width:100%; border-collapse:collapse; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.06); margin-bottom:28px }
+  thead { background:#f1f5f9 }
+  th { padding:8px 10px; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:#64748b; white-space:nowrap }
+  td { padding:7px 10px; border-top:1px solid #f1f5f9; vertical-align:middle; font-size:12px }
+  tr:hover td { background:#fafafa }
+  .footer { margin-top:32px; font-size:11px; color:#9ca3af; text-align:center; padding-top:12px; border-top:1px solid #e5e7eb }
+</style>
+</head>
+<body>
+<h1>HyperMonitor — Infrastructure Report</h1>
+<p class="sub">Generated: ${esc(now)}</p>
+
+<div class="kpi">
+  <div class="kpi-card"><div class="kpi-val">${servers.length}</div><div class="kpi-lbl">Total Hosts</div></div>
+  <div class="kpi-card"><div class="kpi-val">${vms.length}</div><div class="kpi-lbl">Total VMs</div></div>
+  <div class="kpi-card"><div class="kpi-val" style="color:#15803d">${runningVMs}</div><div class="kpi-lbl">Running VMs</div></div>
+  <div class="kpi-card"><div class="kpi-val" style="color:#6b7280">${stoppedVMs}</div><div class="kpi-lbl">Stopped VMs</div></div>
+</div>
+
+<h2>Host Utilisation</h2>
+<table>
+<thead><tr>
+  <th>Host Name</th><th>IP Address</th><th>Hypervisor</th><th>CPU %</th><th>CPU Cores</th>
+  <th>RAM</th><th>Storage</th><th>VMs</th><th>Status</th>
+</tr></thead>
+<tbody>${serverRows}</tbody>
+</table>
+
+<h2>VM Inventory</h2>
+<table>
+<thead><tr>
+  <th>VM Name</th><th>IP</th><th>Hypervisor</th><th>Host Server</th><th>Power</th>
+  <th>CPU %</th><th>vCPUs</th><th>RAM</th><th>Snaps</th>
+  <th>Owner</th><th>Created</th><th>Purpose</th>
+</tr></thead>
+<tbody>${vmRows}</tbody>
+</table>
+
+<div class="footer">HyperMonitor · ${esc(now)}</div>
+</body>
+</html>`;
+}
+
+function triggerHtmlDownload(content, filename) {
+  const blob = new Blob([content], { type: "text/html;charset=utf-8;" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function triggerCsvDownload(content, filename) {
@@ -456,7 +569,7 @@ function triggerCsvDownload(content, filename) {
  * onFilters   – setState setter for filters (used for search + power pill)
  * onVmsUpdated – callback after a successful inline metadata save
  */
-function VMTable({ vms, filters, onFilters, onVmsUpdated, selectedIds, servers = [] }) {
+function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [] }) {
   const [sortKey,  setSortKey]  = useState("vm_name");
   const [sortAsc,  setSortAsc]  = useState(true);
   // Which vm_ids have their snapshot panel expanded
@@ -511,13 +624,13 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, selectedIds, servers =
 
   // ── Apply centralized filters via applyVMFilters (Req 2 + 4) ────────────────
   const displayed = useMemo(() =>
-    applyVMFilters(vms, filters, selectedIds)
+    applyVMFilters(vms, filters)
       .sort((a, b) => {
         const av = a[sortKey], bv = b[sortKey];
         const cmp = typeof av === "number" ? av - bv : String(av).localeCompare(String(bv));
         return sortAsc ? cmp : -cmp;
       }),
-    [vms, filters, selectedIds, sortKey, sortAsc]
+    [vms, filters, sortKey, sortAsc]
   );
 
   const running    = vms.filter(v => v.power_state === "running").length;
@@ -564,12 +677,12 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, selectedIds, servers =
           )}
         </div>
         <div className="flex gap-2 items-center flex-wrap">
-          {/* Search — auto-detects IP / slug / free-text via applyVMFilters (Req 4) */}
+          {/* Search — auto-detects IP / slug / free-text via applyVMFilters */}
           <input type="text"
-                 placeholder="Search VMs, IPs, owners… (auto-detects IP / owner / slug)"
+                 placeholder="Search VMs, IPs, owners…"
                  value={filters.search || ""}
                  onChange={e => onFilters(f => ({ ...f, search: e.target.value }))}
-                 className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-full sm:w-72
+                 className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-full sm:w-64
                    focus:outline-none focus:ring-2 focus:ring-blue-400" />
           {filters.search && (
             <button onClick={() => onFilters(f => ({ ...f, search: "" }))}
@@ -577,6 +690,36 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, selectedIds, servers =
               ✕ clear
             </button>
           )}
+          {/* Download HTML report of currently displayed VMs */}
+          <button
+            onClick={() => {
+              const ts = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "");
+              triggerHtmlDownload(buildPresentationHtml(servers, displayed), `vm_inventory_${ts}.html`);
+            }}
+            title="Download HTML report of displayed VMs"
+            className="flex items-center gap-1 text-xs font-semibold border border-violet-400
+              text-violet-700 px-2.5 py-1.5 rounded-lg hover:bg-violet-50 whitespace-nowrap">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            HTML
+          </button>
+          {/* Download CSV report of currently displayed VMs */}
+          <button
+            onClick={() => {
+              const ts = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "");
+              triggerCsvDownload(buildPresentationCsv(servers, displayed), `vm_inventory_${ts}.csv`);
+            }}
+            title="Download CSV report of displayed VMs"
+            className="flex items-center gap-1 text-xs font-semibold border border-emerald-400
+              text-emerald-700 px-2.5 py-1.5 rounded-lg hover:bg-emerald-50 whitespace-nowrap">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            CSV
+          </button>
         </div>
       </div>
 
