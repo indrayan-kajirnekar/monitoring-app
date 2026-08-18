@@ -33,33 +33,36 @@ const _SLUG_RE = /^[a-z0-9]+-[a-z0-9-]+$/i;
 
 function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }) {
   return vms.filter(vm => {
-    // Level 1 — hypervisor type
-    if (hypervisorType && vm.hypervisor_type !== hypervisorType) return false;
-    // Level 2 — specific server (cascades from Level 1)
-    if (serverId      && vm.host_server_id  !== serverId)       return false;
+    // If a specific server is selected, it alone is the source of truth.
+    // We match on host_server_id AND (as a safety net) on hypervisor_type
+    // so stale / cross-server data can never slip through.
+    if (serverId) {
+      if (String(vm.host_server_id) !== String(serverId)) return false;
+    } else if (hypervisorType) {
+      // No specific server selected — filter by hypervisor type only
+      if (vm.hypervisor_type !== hypervisorType) return false;
+    }
+
     // Power state filter
     if (powerState && powerState !== "all" && vm.power_state !== powerState) return false;
 
-    // Smart global search — auto-detects IP / slug / free-text
+    // Smart global search — auto-detects IP / free-text (slug path removed to
+    // avoid false-positive exact-match overrides on server-id-shaped strings)
     if (search) {
       const q = search.trim();
       if (!q) return true;
       if (_IP_RE.test(q)) {
         // IP or prefix — substring on ip_address
         if (!(vm.ip_address || "").includes(q)) return false;
-      } else if (_SLUG_RE.test(q)) {
-        // Slug pattern — exact match on host_server_id OR vm_id
-        const ql = q.toLowerCase();
-        if ((vm.host_server_id || "").toLowerCase() !== ql &&
-            (vm.vm_id          || "").toLowerCase() !== ql) return false;
       } else {
-        // Free text — OR across name / owner / purpose / IP
+        // Free text — OR across name / owner / purpose / IP / hypervisor
         const ql = q.toLowerCase();
         const hit = (
-          (vm.vm_name    || "").toLowerCase().includes(ql) ||
-          (vm.owner_name || "").toLowerCase().includes(ql) ||
-          (vm.purpose    || "").toLowerCase().includes(ql) ||
-          (vm.ip_address || "").toLowerCase().includes(ql)
+          (vm.vm_name        || "").toLowerCase().includes(ql) ||
+          (vm.owner_name     || "").toLowerCase().includes(ql) ||
+          (vm.purpose        || "").toLowerCase().includes(ql) ||
+          (vm.ip_address     || "").toLowerCase().includes(ql) ||
+          (vm.hypervisor_type|| "").toLowerCase().includes(ql)
         );
         if (!hit) return false;
       }
@@ -622,7 +625,7 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [] }) {
     else { setSortKey(key); setSortAsc(true); }
   };
 
-  // ── Apply centralized filters via applyVMFilters (Req 2 + 4) ────────────────
+  // ── Apply centralized filters ─────────────────────────────────────────────
   const displayed = useMemo(() =>
     applyVMFilters(vms, filters)
       .sort((a, b) => {
@@ -1406,7 +1409,17 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
             </label>
             <select
               value={filters.serverId}
-              onChange={e => setFilters(f => ({ ...f, serverId: e.target.value }))}
+              onChange={e => {
+                const sid = e.target.value;
+                const srv = l2Servers.find(s => s.server_id === sid);
+                setFilters(f => ({
+                  ...f,
+                  serverId:       sid,
+                  // Also pin hypervisorType so the filter is unambiguous
+                  hypervisorType: srv ? srv.hypervisor_type : f.hypervisorType,
+                  search:         "",
+                }));
+              }}
               disabled={l2Servers.length === 0}
               className="border border-slate-300 rounded-lg px-3 py-2 text-sm
                 focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white
