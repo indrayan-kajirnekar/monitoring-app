@@ -66,16 +66,18 @@ class VMQueryBuilder:
     def filter_hypervisor(self, hypervisor_type: str | None) -> "VMQueryBuilder":
         """Narrow to a specific hypervisor type; no-op when None or empty."""
         if hypervisor_type:
+            ht_str = str(hypervisor_type)
             self._predicates.append(
-                lambda vm, ht=hypervisor_type: vm.get("hypervisor_type") == ht
+                lambda vm, ht=ht_str: str(vm.get("hypervisor_type", "")) == ht
             )
         return self
 
     def filter_server(self, server_id: str | None) -> "VMQueryBuilder":
-        """Narrow to VMs belonging to a specific host server_id."""
+        """Narrow to VMs belonging to a specific host server_id (strict, type-safe match)."""
         if server_id:
+            sid_str = str(server_id)
             self._predicates.append(
-                lambda vm, sid=server_id: vm.get("host_server_id") == sid
+                lambda vm, sid=sid_str: str(vm.get("host_server_id", "")) == sid
             )
         return self
 

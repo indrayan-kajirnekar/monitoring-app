@@ -1053,13 +1053,23 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     });
   };
 
+  // Tracks the in-flight /api/vms request so a slow, stale request can be
+  // aborted the instant a newer server/hypervisor selection is made —
+  // preventing a race condition where an old response overwrites new state.
+  const vmAbortRef = useRef(null);
+
   const fetchAll = useCallback(async (isBackground = false, vmParams = {}) => {
     if (isBackground) setFetching(true);
+
+    // Cancel any previous /api/vms request that hasn't resolved yet.
+    if (vmAbortRef.current) vmAbortRef.current.abort();
+    const controller = new AbortController();
+    vmAbortRef.current = controller;
+
     try {
-      // VM inventory is requested with server-side filter params (Req 2) so the
-      // API itself — using the already-tested VMQueryBuilder — is the single
-      // source of truth for "which VMs belong to which server". This removes
-      // any dependency on client-side array filtering being bug-free.
+      // VM inventory is requested with server-side filter params so the API
+      // itself — using the already-tested VMQueryBuilder — is the single
+      // source of truth for "which VMs belong to which server".
       const vmQuery = {};
       if (vmParams.hypervisorType) vmQuery.hypervisor_type = vmParams.hypervisorType;
       if (vmParams.serverId)       vmQuery.server_id       = vmParams.serverId;
@@ -1069,7 +1079,7 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
 
       const [sRes, vRes, hRes] = await Promise.all([
         axios.get(`${API}/api/servers`),
-        axios.get(`${API}/api/vms`, { params: vmQuery }),
+        axios.get(`${API}/api/vms`, { params: vmQuery, signal: controller.signal }),
         axios.get(`${API}/api/hypervisors`),
       ]);
       setServers(sRes.data);
@@ -1078,6 +1088,8 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
       setLastUpdated(new Date().toLocaleTimeString());
       setError(null);
     } catch (err) {
+      // A newer request superseded this one — not a real error, ignore.
+      if (axios.isCancel(err) || err?.code === "ERR_CANCELED") return;
       const status = err?.response?.status;
       if (status === 403) {
         setError("Permission denied — your account needs the 'dashboard_view' permission. Ask an Administrator to assign you to a group (e.g. Team, Leads, or Administrator).");
@@ -1107,9 +1119,11 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   }, [fetchAll]);
 
   // Re-fetch VM inventory from the server whenever the server/hypervisor
-  // filter changes, so the authoritative filtered list always comes from the
-  // backend (defense in depth on top of the client-side applyVMFilters).
+  // filter changes. The VM list is cleared immediately so no stale/mixed
+  // rows from the previous selection are visible while the new data loads;
+  // the in-flight-request abort above guards against race conditions.
   useEffect(() => {
+    setVms([]);
     fetchAll(true, filters);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters.hypervisorType, filters.serverId, filters.powerState]);
