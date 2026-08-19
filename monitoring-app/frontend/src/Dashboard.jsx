@@ -1053,12 +1053,23 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     });
   };
 
-  const fetchAll = useCallback(async (isBackground = false) => {
+  const fetchAll = useCallback(async (isBackground = false, vmParams = {}) => {
     if (isBackground) setFetching(true);
     try {
+      // VM inventory is requested with server-side filter params (Req 2) so the
+      // API itself — using the already-tested VMQueryBuilder — is the single
+      // source of truth for "which VMs belong to which server". This removes
+      // any dependency on client-side array filtering being bug-free.
+      const vmQuery = {};
+      if (vmParams.hypervisorType) vmQuery.hypervisor_type = vmParams.hypervisorType;
+      if (vmParams.serverId)       vmQuery.server_id       = vmParams.serverId;
+      if (vmParams.powerState && vmParams.powerState !== "all")
+        vmQuery.power_state = vmParams.powerState;
+      if (vmParams.search)         vmQuery.search           = vmParams.search;
+
       const [sRes, vRes, hRes] = await Promise.all([
         axios.get(`${API}/api/servers`),
-        axios.get(`${API}/api/vms`),
+        axios.get(`${API}/api/vms`, { params: vmQuery }),
         axios.get(`${API}/api/hypervisors`),
       ]);
       setServers(sRes.data);
@@ -1082,11 +1093,26 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     }
   }, []);
 
+  // Keep a ref to the latest filters so the polling interval (set up once)
+  // always reads current values instead of a stale closure.
+  const filtersRef = useRef(filters);
+  useEffect(() => { filtersRef.current = filters; }, [filters]);
+
+  // Initial load + recurring poll — always uses the latest filters via ref
   useEffect(() => {
-    fetchAll(false);
-    intervalRef.current = setInterval(() => fetchAll(true), POLL_MS);
+    fetchAll(false, filtersRef.current);
+    intervalRef.current = setInterval(() => fetchAll(true, filtersRef.current), POLL_MS);
     return () => clearInterval(intervalRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchAll]);
+
+  // Re-fetch VM inventory from the server whenever the server/hypervisor
+  // filter changes, so the authoritative filtered list always comes from the
+  // backend (defense in depth on top of the client-side applyVMFilters).
+  useEffect(() => {
+    fetchAll(true, filters);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters.hypervisorType, filters.serverId, filters.powerState]);
 
   // ── Permission guard — show a clear message before any API calls ──────────
   if (permissions && permissions.dashboard_view === false) {
@@ -1108,7 +1134,7 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     setRefreshing(true);
     try {
       await axios.post(`${API}/api/cache/refresh`, {});
-      await fetchAll(false);
+      await fetchAll(false, filters);
     } catch { /* fetchAll shows error */ }
     finally { setRefreshing(false); }
   };
@@ -1558,7 +1584,7 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
           vms={vms}
           filters={filters}
           onFilters={setFilters}
-          onVmsUpdated={() => fetchAll(true)}
+          onVmsUpdated={() => fetchAll(true, filters)}
           selectedIds={selectedIds}
           servers={servers}
         />
