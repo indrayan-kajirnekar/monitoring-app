@@ -32,20 +32,27 @@ class KVMAdapter(HypervisorInterface):
 
     def get_vm_snapshots(self, vm_name: str) -> list[dict[str, Any]]:
         """
-        List snapshots via:  virsh snapshot-list <vm> --tree
+        List snapshots for a VM via virsh snapshot-list.
         Returns normalized SnapshotDicts.
         """
         try:
             client = self._connect()
+            # Do NOT use --no-metadata: that flag skips internal snapshots
+            # (the default type on most KVM hosts), leaving the list empty.
+            # Omitting it returns all snapshot types (internal + external).
             out = self._run(
                 client,
-                f"virsh -c qemu:///system snapshot-list '{vm_name}' "
-                "--no-metadata 2>/dev/null || echo ''",
+                f"virsh -c qemu:///system snapshot-list '{vm_name}' 2>/dev/null"
+                " || virsh snapshot-list '{vm_name}' 2>/dev/null || echo ''",
             )
             client.close()
             snaps: list[dict[str, Any]] = []
-            for line in out.splitlines()[2:]:   # skip header rows
-                parts = line.split()
+            for line in out.splitlines():
+                # Header lines start with " Name" or "---"; skip them
+                stripped = line.strip()
+                if not stripped or stripped.startswith("Name") or stripped.startswith("-"):
+                    continue
+                parts = stripped.split()
                 if len(parts) < 3:
                     continue
                 snap_name   = parts[0]
