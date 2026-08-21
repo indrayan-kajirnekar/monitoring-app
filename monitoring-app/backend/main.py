@@ -1162,6 +1162,26 @@ async def get_hypervisor_summary(db: AsyncSession = Depends(get_db)):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Snapshot counts — lightweight dict for the VM inventory badge
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/snapshots/counts", tags=["Snapshots"],
+         dependencies=[Depends(_auth.require_perm("dashboard_view"))])
+async def get_snapshot_counts(db: AsyncSession = Depends(get_db)):
+    """
+    Return a mapping of { vm_id: count } for every vm_id that has at least
+    one persisted snapshot row.  Used by the Dashboard VM table to eagerly
+    populate the Snapshots badge without waiting for the user to expand a panel.
+    """
+    from sqlalchemy import func as sa_func
+    result = await db.execute(
+        select(models.VMSnapshot.vm_id, sa_func.count().label("cnt"))
+        .group_by(models.VMSnapshot.vm_id)
+    )
+    return {row.vm_id: row.cnt for row in result.all()}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Cache refresh endpoint — triggers an immediate re-poll outside the 30 s cycle
 # ──────────────────────────────────────────────────────────────────────────────
 

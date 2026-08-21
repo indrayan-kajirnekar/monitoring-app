@@ -573,16 +573,13 @@ function triggerCsvDownload(content, filename) {
  * onFilters   – setState setter for filters (used for search + power pill)
  * onVmsUpdated – callback after a successful inline metadata save
  */
-function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [] }) {
+function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [],
+                   snapCounts = {}, onSnapCount }) {
   const [sortKey,  setSortKey]  = useState("vm_name");
   const [sortAsc,  setSortAsc]  = useState(true);
   // Which vm_ids have their snapshot panel expanded
   const [snapOpen, setSnapOpen] = useState({});
   const toggleSnap = (vmId) => setSnapOpen(s => ({ ...s, [vmId]: !s[vmId] }));
-  // Live snapshot counts updated when a SnapshotPanel fetches data
-  const [snapCounts, setSnapCounts] = useState({});
-  const handleSnapCount = (vmId, count) =>
-    setSnapCounts(c => ({ ...c, [vmId]: count }));
 
   // Inline edit state: { [vm_id]: { owner_name, purpose } }
   const [edits,  setEdits]  = useState({});
@@ -955,7 +952,7 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [] }) {
                           Snapshots — {vm.vm_name}
                         </span>
                       </div>
-                      <SnapshotPanel vmId={vm.vm_id} vmName={vm.vm_name} onSnapCount={handleSnapCount} />
+                      <SnapshotPanel vmId={vm.vm_id} vmName={vm.vm_name} onSnapCount={onSnapCount} />
                     </td>
                   </tr>
                 )}
@@ -1014,6 +1011,10 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   const [servers,     setServers]     = useState([]);
   const [vms,         setVms]         = useState([]);
   const [hypervisors, setHypervisors] = useState([]);
+  // Snapshot counts keyed by vm_id — seeded from DB on load, updated live by panel
+  const [snapCounts,  setSnapCounts]  = useState({});
+  const handleSnapCount = useCallback((vmId, count) =>
+    setSnapCounts(c => ({ ...c, [vmId]: count })), []);
   const [loading,     setLoading]     = useState(true);
   const [fetching,    setFetching]    = useState(false);
   const [refreshing,  setRefreshing]  = useState(false);
@@ -1093,14 +1094,17 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
         vmQuery.power_state = vmParams.powerState;
       if (vmParams.search)         vmQuery.search           = vmParams.search;
 
-      const [sRes, vRes, hRes] = await Promise.all([
+      const [sRes, vRes, hRes, cRes] = await Promise.all([
         axios.get(`${API}/api/servers`),
         axios.get(`${API}/api/vms`, { params: vmQuery, signal: controller.signal }),
         axios.get(`${API}/api/hypervisors`),
+        axios.get(`${API}/api/snapshots/counts`),
       ]);
       setServers(sRes.data);
       setVms(vRes.data);
       setHypervisors(hRes.data);
+      // Seed snapshot counts from DB; panel expansions will override with live counts
+      setSnapCounts(prev => ({ ...prev, ...cRes.data }));
       setLastUpdated(new Date().toLocaleTimeString());
       setError(null);
     } catch (err) {
@@ -1135,12 +1139,11 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   }, [fetchAll]);
 
   // Re-fetch VM inventory from the server whenever the server/hypervisor
-  // filter changes. The VM list is cleared immediately so no stale/mixed
-  // rows from the previous selection are visible while the new data loads;
-  // the in-flight-request abort above guards against race conditions.
+  // filter changes. Use filtersRef.current (not the stale closure `filters`)
+  // so the API call always carries the latest filter values.
   useEffect(() => {
     setVms([]);
-    fetchAll(true, filters);
+    fetchAll(true, filtersRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters.hypervisorType, filters.serverId, filters.powerState]);
 
@@ -1614,9 +1617,10 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
           vms={vms}
           filters={filters}
           onFilters={setFilters}
-          onVmsUpdated={() => fetchAll(true, filters)}
-          selectedIds={selectedIds}
+          onVmsUpdated={() => fetchAll(true, filtersRef.current)}
           servers={servers}
+          snapCounts={snapCounts}
+          onSnapCount={handleSnapCount}
         />
       </section>
 
