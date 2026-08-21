@@ -98,17 +98,46 @@ class ESXiAdapter(HypervisorInterface):
 
         si, content = self._connect()
 
-        # ── Host aggregate metrics ─────────────────────────────────────────────
+        # ── Scope to the single host matching self.ip ─────────────────────────
+        # When connected to a vCenter that manages multiple ESXi hosts, the
+        # container view would return ALL hosts and ALL VMs in the cluster.
+        # Two ServerConfig entries (e.g. ESXi01 and ESXi02) would each report
+        # the full inventory → every VM duplicated N times in /api/vms.
+        # Fix: find the one HostSystem whose management IP matches self.ip and
+        # scope all subsequent queries to that host only.
         host_view = content.viewManager.CreateContainerView(
             content.rootFolder, [vim.HostSystem], True
         )
-        hosts = host_view.view
+        all_hosts = host_view.view
         host_view.Destroy()
 
-        if not hosts:
+        if not all_hosts:
             Disconnect(si)
             raise RuntimeError("No ESXi hosts found in inventory.")
 
+        # Match by management IP (summary.managementServerIp or config.network
+        # addresses). Fall back to using ALL hosts if no match (standalone ESXi).
+        def _host_ips(h) -> set[str]:
+            ips: set[str] = set()
+            try:
+                for nic in h.config.network.vnic:
+                    ips.add(nic.spec.ip.ipAddress)
+            except Exception:
+                pass
+            try:
+                ips.add(h.summary.managementServerIp or "")
+            except Exception:
+                pass
+            try:
+                ips.add(h.name)   # hostname or IP as registered in vCenter
+            except Exception:
+                pass
+            return ips
+
+        matched = [h for h in all_hosts if self.ip in _host_ips(h)]
+        hosts = matched if matched else all_hosts  # fallback: standalone ESXi
+
+        # ── Host aggregate metrics (scoped to this host only) ─────────────────
         total_ram_bytes = sum(h.hardware.memorySize for h in hosts)
         total_cpu_cores = sum(h.hardware.cpuInfo.numCpuCores for h in hosts)
         cpu_used_mhz    = sum(
@@ -128,18 +157,21 @@ class ESXiAdapter(HypervisorInterface):
         ram_used_gb  = round(ram_used_bytes  / (1024 ** 3), 1)
         ram_pct      = round(ram_used_gb / max(ram_total_gb, 0.1) * 100, 1)
 
-        # ── Datastores ────────────────────────────────────────────────────────
-        ds_view = content.viewManager.CreateContainerView(
-            content.rootFolder, [vim.Datastore], True
-        )
-        datastores = ds_view.view
-        ds_view.Destroy()
-
+        # ── Datastores — only datastores mounted on this host ─────────────────
+        # Collect the set of datastores accessible from the matched host(s) so
+        # shared datastores are not double-counted across two ESXi entries.
         seen: set[str] = set()
         drives: list[dict] = []
         total_cap_bytes = total_free_bytes = 0
 
-        for ds in datastores:
+        host_datastores: list = []
+        for h in hosts:
+            try:
+                host_datastores.extend(h.datastore)
+            except Exception:
+                pass
+
+        for ds in host_datastores:
             if ds.name in seen:
                 continue
             seen.add(ds.name)
@@ -163,7 +195,11 @@ class ESXiAdapter(HypervisorInterface):
         storage_used_tb  = round((total_cap_bytes - total_free_bytes)      / (1024 ** 4), 3)
         storage_pct      = round(storage_used_tb / max(storage_total_tb, 0.001) * 100, 1)
 
-        # ── VM inventory ──────────────────────────────────────────────────────
+        # ── VM inventory — only VMs whose runtime.host is one of our hosts ────
+        # This is the critical filter: without it every vCenter-connected ESXi
+        # entry returns the FULL cluster inventory, causing N-fold duplicates.
+        host_refs = {h._moId for h in hosts}
+
         vm_view = content.viewManager.CreateContainerView(
             content.rootFolder, [vim.VirtualMachine], True
         )
@@ -175,6 +211,12 @@ class ESXiAdapter(HypervisorInterface):
             cfg = vm.config
             if cfg is None:
                 continue
+            # Skip VMs not running on this host
+            try:
+                if vm.runtime.host._moId not in host_refs:
+                    continue
+            except Exception:
+                pass
             qs  = vm.summary.quickStats
             gs  = vm.guest
             p_map = {
