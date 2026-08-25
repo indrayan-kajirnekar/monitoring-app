@@ -692,9 +692,12 @@ async def get_servers(db: AsyncSession = Depends(get_db)):
     if truly_cold:
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(truly_cold)) as pool:
-            futures = [loop.run_in_executor(pool, _fetch_live_metrics, r) for r in truly_cold]
-            for m in await asyncio.gather(*futures):
-                metrics_cache.set_cached(m["server_id"], m)
+            # Keep (future, row) paired so the correct server_id is always used
+            # as the cache key regardless of completion order.
+            pairs = [(loop.run_in_executor(pool, _fetch_live_metrics, r), r) for r in truly_cold]
+            for fut, row in pairs:
+                m = await fut
+                metrics_cache.set_cached(row.server_id, m)
                 out.append(_metrics_to_server_model(m))
 
     return out
@@ -755,9 +758,12 @@ async def get_vms(
     if truly_cold:
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(truly_cold)) as pool:
-            futures = [loop.run_in_executor(pool, _fetch_live_metrics, r) for r in truly_cold]
-            for m in await asyncio.gather(*futures):
-                metrics_cache.set_cached(m["server_id"], m)
+            # Keep (future, row) paired so the correct server_id is always used
+            # as the cache key regardless of completion order.
+            pairs = [(loop.run_in_executor(pool, _fetch_live_metrics, r), r) for r in truly_cold]
+            for fut, row in pairs:
+                m = await fut
+                metrics_cache.set_cached(row.server_id, m)
                 all_metrics.append(m)
 
     # Load all static VM metadata in one query (for owner/purpose enrichment)
@@ -1140,9 +1146,10 @@ async def get_hypervisor_summary(db: AsyncSession = Depends(get_db)):
     if truly_cold:
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(truly_cold)) as pool:
-            futures = [loop.run_in_executor(pool, _fetch_live_metrics, r) for r in truly_cold]
-            for m in await asyncio.gather(*futures):
-                metrics_cache.set_cached(m["server_id"], m)
+            pairs = [(loop.run_in_executor(pool, _fetch_live_metrics, r), r) for r in truly_cold]
+            for fut, row in pairs:
+                m = await fut
+                metrics_cache.set_cached(row.server_id, m)
                 all_metrics.append(m)
 
     groups: Dict[str, list] = {}
@@ -1211,17 +1218,18 @@ async def refresh_cache(
         raise HTTPException(404, "No matching enabled servers found.")
 
     loop = asyncio.get_running_loop()
+    refreshed_ids = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(rows), 8)) as pool:
-        futures = [loop.run_in_executor(pool, _fetch_live_metrics, r) for r in rows]
-        results = await asyncio.gather(*futures)
-
-    for m in results:
-        metrics_cache.set_cached(m["server_id"], m)
+        pairs = [(loop.run_in_executor(pool, _fetch_live_metrics, r), r) for r in rows]
+        for fut, row in pairs:
+            m = await fut
+            metrics_cache.set_cached(row.server_id, m)
+            refreshed_ids.append(row.server_id)
 
     return {
-        "status":   "ok",
-        "refreshed": [m["server_id"] for m in results],
-        "count":    len(results),
+        "status":    "ok",
+        "refreshed": refreshed_ids,
+        "count":     len(refreshed_ids),
     }
 
 

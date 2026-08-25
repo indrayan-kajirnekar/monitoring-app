@@ -31,38 +31,48 @@ const POLL_MS = 30000;
 const _IP_RE   = /^(\d{1,3}\.){1,3}\d{0,3}$|^[\da-fA-F:]{2,39}$/;
 const _SLUG_RE = /^[a-z0-9]+-[a-z0-9-]+$/i;
 
+// Return true if `query` matches `text` using these rules:
+//   • If query contains spaces  → substring match (user typed a phrase)
+//   • If query has no spaces    → whole-word match (split on non-alphanumeric
+//                                 boundaries so "web" matches "web server" and
+//                                 "WEB_01" but NOT "webhost" or "sarath_web")
+function _textMatch(text, query) {
+  const hay = (text || "").toLowerCase();
+  const q   = query.toLowerCase();
+  if (q.includes(" ")) return hay.includes(q);           // phrase → substring
+  // Whole-word: split haystack on anything that isn't a letter/digit/dot
+  // then check for an exact token match.
+  const tokens = hay.split(/[^a-z0-9.]+/);
+  return tokens.some(t => t === q);
+}
+
 function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }) {
   return vms.filter(vm => {
-    // If a specific server is selected, it alone is the source of truth.
-    // We match on host_server_id AND (as a safety net) on hypervisor_type
-    // so stale / cross-server data can never slip through.
+    // Server / hypervisor dropdown filters — exact match, unchanged
     if (serverId) {
       if (String(vm.host_server_id) !== String(serverId)) return false;
     } else if (hypervisorType) {
-      // No specific server selected — filter by hypervisor type only
       if (vm.hypervisor_type !== hypervisorType) return false;
     }
 
     // Power state filter
     if (powerState && powerState !== "all" && vm.power_state !== powerState) return false;
 
-    // Smart global search — auto-detects IP / free-text (slug path removed to
-    // avoid false-positive exact-match overrides on server-id-shaped strings)
+    // Search filter
     if (search) {
       const q = search.trim();
       if (!q) return true;
       if (_IP_RE.test(q)) {
-        // IP or prefix — substring on ip_address
+        // IP / prefix — substring match on ip_address (192.168.1 style)
         if (!(vm.ip_address || "").includes(q)) return false;
       } else {
-        // Free text — OR across name / owner / purpose / IP / hypervisor
-        const ql = q.toLowerCase();
+        // Word/phrase match across vm_name, owner, purpose, ip, hypervisor
         const hit = (
-          (vm.vm_name        || "").toLowerCase().includes(ql) ||
-          (vm.owner_name     || "").toLowerCase().includes(ql) ||
-          (vm.purpose        || "").toLowerCase().includes(ql) ||
-          (vm.ip_address     || "").toLowerCase().includes(ql) ||
-          (vm.hypervisor_type|| "").toLowerCase().includes(ql)
+          _textMatch(vm.vm_name,         q) ||
+          _textMatch(vm.owner_name,      q) ||
+          _textMatch(vm.purpose,         q) ||
+          _textMatch(vm.ip_address,      q) ||
+          _textMatch(vm.hypervisor_type, q)
         );
         if (!hit) return false;
       }
@@ -1075,7 +1085,7 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   // preventing a race condition where an old response overwrites new state.
   const vmAbortRef = useRef(null);
 
-  const fetchAll = useCallback(async (isBackground = false, vmParams = {}) => {
+  const fetchAll = useCallback(async (isBackground = false) => {
     if (isBackground) setFetching(true);
 
     // Cancel any previous /api/vms request that hasn't resolved yet.
@@ -1084,19 +1094,15 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     vmAbortRef.current = controller;
 
     try {
-      // VM inventory is requested with server-side filter params so the API
-      // itself — using the already-tested VMQueryBuilder — is the single
-      // source of truth for "which VMs belong to which server".
-      const vmQuery = {};
-      if (vmParams.hypervisorType) vmQuery.hypervisor_type = vmParams.hypervisorType;
-      if (vmParams.serverId)       vmQuery.server_id       = vmParams.serverId;
-      if (vmParams.powerState && vmParams.powerState !== "all")
-        vmQuery.power_state = vmParams.powerState;
-      if (vmParams.search)         vmQuery.search           = vmParams.search;
-
+      // Always fetch the FULL unfiltered VM list from the API.
+      // All filtering (hypervisor, server, power state, search) is done
+      // entirely client-side by applyVMFilters in VMTable.
+      // This eliminates the dual-filter bug where server-side filtering
+      // returned a stale subset that client-side filters then ran on top of,
+      // causing wrong VMs to appear or valid VMs to go missing.
       const [sRes, vRes, hRes, cRes] = await Promise.all([
         axios.get(`${API}/api/servers`),
-        axios.get(`${API}/api/vms`, { params: vmQuery, signal: controller.signal }),
+        axios.get(`${API}/api/vms`, { signal: controller.signal }),
         axios.get(`${API}/api/hypervisors`),
         axios.get(`${API}/api/snapshots/counts`),
       ]);
@@ -1130,22 +1136,17 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
   const filtersRef = useRef(filters);
   useEffect(() => { filtersRef.current = filters; }, [filters]);
 
-  // Initial load + recurring poll — always uses the latest filters via ref
+  // Initial load + recurring poll — fetches the full unfiltered VM list each time.
+  // Client-side applyVMFilters applies all active filters instantly on the result.
   useEffect(() => {
-    fetchAll(false, filtersRef.current);
-    intervalRef.current = setInterval(() => fetchAll(true, filtersRef.current), POLL_MS);
+    fetchAll(false);
+    intervalRef.current = setInterval(() => fetchAll(true), POLL_MS);
     return () => clearInterval(intervalRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchAll]);
 
-  // Re-fetch VM inventory from the server whenever the server/hypervisor
-  // filter changes. Use filtersRef.current (not the stale closure `filters`)
-  // so the API call always carries the latest filter values.
-  useEffect(() => {
-    setVms([]);
-    fetchAll(true, filtersRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters.hypervisorType, filters.serverId, filters.powerState]);
+  // No separate re-fetch needed when filters change — filtering is now 100%
+  // client-side, so changing any filter is instant with no API round-trip.
 
   // ── Permission guard — show a clear message before any API calls ──────────
   if (permissions && permissions.dashboard_view === false) {
@@ -1167,7 +1168,7 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     setRefreshing(true);
     try {
       await axios.post(`${API}/api/cache/refresh`, {});
-      await fetchAll(false, filters);
+      await fetchAll(false);
     } catch { /* fetchAll shows error */ }
     finally { setRefreshing(false); }
   };
@@ -1617,7 +1618,7 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
           vms={vms}
           filters={filters}
           onFilters={setFilters}
-          onVmsUpdated={() => fetchAll(true, filtersRef.current)}
+          onVmsUpdated={() => fetchAll(true)}
           servers={servers}
           snapCounts={snapCounts}
           onSnapCount={handleSnapCount}
