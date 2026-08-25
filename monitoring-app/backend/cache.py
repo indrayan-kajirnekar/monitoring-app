@@ -117,25 +117,28 @@ async def _poll_loop(fetch_fn, get_rows_fn) -> None:
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(len(rows), 8)
                 ) as pool:
-                    # IMPORTANT: keep (future, row) pairs together so results
-                    # are always stored under the correct server_id.
-                    # The previous dict approach iterated futures in insertion
-                    # order while awaiting them sequentially — if futures
-                    # completed out of order the wrong sid was paired with the
-                    # wrong result, cross-contaminating the cache.
-                    pairs = [
-                        (loop.run_in_executor(pool, fetch_fn, r), r.server_id)
+                    # Submit ALL fetches simultaneously so every hypervisor is
+                    # polled in parallel.  Sequential awaiting caused slow hosts
+                    # (ESXi ~8 s) to block the loop, leaving fast hosts (KVM
+                    # ~2 s) with expired TTLs before their result was stored.
+                    # asyncio.gather runs all futures concurrently and returns
+                    # results in the SAME ORDER as the input list — so index i
+                    # in results always corresponds to rows[i]. No dict, no
+                    # ordering ambiguity, no cross-contamination.
+                    futures = [
+                        loop.run_in_executor(pool, fetch_fn, r)
                         for r in rows
                     ]
-                    for fut, sid in pairs:
-                        try:
-                            result = await fut
-                            # Always use the server_id from the row, never from
-                            # the result dict — guards against any adapter that
-                            # returns a mismatched server_id on error.
-                            set_cached(sid, result)
-                        except Exception as exc:
-                            log.warning("Poll failed for %s: %s", sid, exc)
+                    results = await asyncio.gather(*futures, return_exceptions=True)
+                    for row, result in zip(rows, results):
+                        if isinstance(result, Exception):
+                            log.warning("Poll failed for %s: %s",
+                                        row.server_id, result)
+                        else:
+                            # Always key by row.server_id — never trust the
+                            # server_id field inside the result dict, which
+                            # could be wrong if an adapter had an error path.
+                            set_cached(row.server_id, result)
         except Exception as exc:
             log.error("Background poll loop error: %s", exc)
 

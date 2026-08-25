@@ -692,11 +692,12 @@ async def get_servers(db: AsyncSession = Depends(get_db)):
     if truly_cold:
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(truly_cold)) as pool:
-            # Keep (future, row) paired so the correct server_id is always used
-            # as the cache key regardless of completion order.
-            pairs = [(loop.run_in_executor(pool, _fetch_live_metrics, r), r) for r in truly_cold]
-            for fut, row in pairs:
-                m = await fut
+            futures = [loop.run_in_executor(pool, _fetch_live_metrics, r)
+                       for r in truly_cold]
+            results = await asyncio.gather(*futures, return_exceptions=True)
+            for row, m in zip(truly_cold, results):
+                if isinstance(m, Exception):
+                    continue
                 metrics_cache.set_cached(row.server_id, m)
                 out.append(_metrics_to_server_model(m))
 
@@ -744,32 +745,36 @@ async def get_vms(
     if not rows:
         return []
 
-    # Stale-while-revalidate: return any cached data immediately
-    all_metrics = []
+    # Stale-while-revalidate: return any cached data immediately.
+    # Store (row, data) pairs so VM records always use the DB row as the
+    # authoritative source of server_id and hypervisor_type — never the
+    # values inside the cached dict, which could be stale/wrong.
+    all_metrics: List[tuple] = []   # list of (ServerConfig row, metrics dict)
     truly_cold  = []
     for row in rows:
         data = metrics_cache.get_cached(row.server_id) \
                or metrics_cache.get_cached_stale(row.server_id)
         if data:
-            all_metrics.append(data)
+            all_metrics.append((row, data))
         else:
             truly_cold.append(row)
 
     if truly_cold:
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(truly_cold)) as pool:
-            # Keep (future, row) paired so the correct server_id is always used
-            # as the cache key regardless of completion order.
-            pairs = [(loop.run_in_executor(pool, _fetch_live_metrics, r), r) for r in truly_cold]
-            for fut, row in pairs:
-                m = await fut
+            futures = [loop.run_in_executor(pool, _fetch_live_metrics, r)
+                       for r in truly_cold]
+            results = await asyncio.gather(*futures, return_exceptions=True)
+            for row, m in zip(truly_cold, results):
+                if isinstance(m, Exception):
+                    continue
                 metrics_cache.set_cached(row.server_id, m)
-                all_metrics.append(m)
+                all_metrics.append((row, m))
 
     # Load all static VM metadata in one query (for owner/purpose enrichment)
     meta_result = await db.execute(select(models.VMMetadata))
     static_map: Dict[str, models.VMMetadata] = {
-        m.vm_name: m for m in meta_result.scalars().all()
+        md.vm_name: md for md in meta_result.scalars().all()
     }
 
     # Load snapshot counts grouped by vm_id in one query
@@ -778,15 +783,16 @@ async def get_vms(
         select(models.VMSnapshot.vm_id, sa_func.count().label("cnt"))
         .group_by(models.VMSnapshot.vm_id)
     )
-    snapshot_counts: Dict[str, int] = {row.vm_id: row.cnt for row in snap_result.all()}
+    snapshot_counts: Dict[str, int] = {r.vm_id: r.cnt for r in snap_result.all()}
 
     out: List[VMRecord] = []
     today = date.today()
     vm_idx = 0
 
-    for m in all_metrics:
-        host_server_id = m["server_id"]
-        hv_type        = m["hypervisor_type"]
+    for srv_row, m in all_metrics:
+        # Use DB row as authoritative source — never the cached dict values
+        host_server_id = srv_row.server_id
+        hv_type        = srv_row.hypervisor_type
 
         for vm in m.get("vms", []):
             vm_name    = vm["vm_name"]
@@ -1139,22 +1145,25 @@ async def get_hypervisor_summary(db: AsyncSession = Depends(get_db)):
         data = metrics_cache.get_cached(row.server_id) \
                or metrics_cache.get_cached_stale(row.server_id)
         if data:
-            all_metrics.append(data)
+            all_metrics.append((row.hypervisor_type, data))
         else:
             truly_cold.append(row)
 
     if truly_cold:
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(truly_cold)) as pool:
-            pairs = [(loop.run_in_executor(pool, _fetch_live_metrics, r), r) for r in truly_cold]
-            for fut, row in pairs:
-                m = await fut
+            futures = [loop.run_in_executor(pool, _fetch_live_metrics, r)
+                       for r in truly_cold]
+            results = await asyncio.gather(*futures, return_exceptions=True)
+            for row, m in zip(truly_cold, results):
+                if isinstance(m, Exception):
+                    continue
                 metrics_cache.set_cached(row.server_id, m)
-                all_metrics.append(m)
+                all_metrics.append((row.hypervisor_type, m))
 
     groups: Dict[str, list] = {}
-    for m in all_metrics:
-        groups.setdefault(m["hypervisor_type"], []).append(m)
+    for hv_type, m in all_metrics:
+        groups.setdefault(hv_type, []).append(m)
 
     out = []
     for name, hosts in groups.items():
