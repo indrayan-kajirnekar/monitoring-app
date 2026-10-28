@@ -130,14 +130,15 @@ class VMQueryBuilder:
                 )
             )
         else:
-            # Free-text: OR across name / owner / purpose
+            # Free-text: OR across name / owner / purpose / ip / hypervisor type
             ql = q.lower()
             self._predicates.append(
                 lambda vm, _ql=ql: (
-                    _ql in (vm.get("vm_name")    or "").lower()
-                    or _ql in (vm.get("owner_name") or "").lower()
-                    or _ql in (vm.get("purpose")    or "").lower()
-                    or _ql in (vm.get("ip_address") or "").lower()
+                    _ql in (vm.get("vm_name")         or "").lower()
+                    or _ql in (vm.get("owner_name")   or "").lower()
+                    or _ql in (vm.get("purpose")      or "").lower()
+                    or _ql in (vm.get("ip_address")   or "").lower()
+                    or _ql in (vm.get("hypervisor_type") or "").lower()
                 )
             )
         return self

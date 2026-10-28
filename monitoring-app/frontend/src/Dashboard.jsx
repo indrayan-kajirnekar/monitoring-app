@@ -28,8 +28,7 @@ const POLL_MS = 30000;
 // on large inventories.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const _IP_RE   = /^(\d{1,3}\.){1,3}\d{0,3}$|^[\da-fA-F:]{2,39}$/;
-const _SLUG_RE = /^[a-z0-9]+-[a-z0-9-]+$/i;
+const _IP_RE = /^(\d{1,3}\.){1,3}\d{0,3}$|^[\da-fA-F:]{2,39}$/;
 
 // Return true if `query` is a substring of `text` (case-insensitive).
 function _textMatch(text, query) {
@@ -746,7 +745,7 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [],
             )}
             {filters.serverId && (
               <strong className="ml-1">
-                {" — "}{servers.find(s => s.server_id === filters.serverId)?.display_name || filters.serverId}
+                {" — "}{servers.find(s => String(s.server_id) === String(filters.serverId))?.display_name || filters.serverId}
               </strong>
             )}
             <span className="ml-2 text-amber-600">
@@ -967,7 +966,10 @@ function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [],
         </table>
       </div>
       <div className="px-5 py-3 border-t border-slate-100 text-xs text-slate-400">
-        Showing {displayed.length} of {vms.length} VMs
+        {(filters.serverId || filters.hypervisorType)
+          ? <>Showing <strong className="text-slate-600">{displayed.length}</strong> filtered VM{displayed.length !== 1 ? "s" : ""} (of {vms.length} total)</>
+          : <>Showing {displayed.length} of {vms.length} VMs</>
+        }
         {dirtyCount > 0 && (
           <span className="ml-3 text-amber-600">
             — {dirtyCount} row{dirtyCount > 1 ? "s" : ""} have unsaved edits
@@ -1125,11 +1127,6 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     }
   }, []);
 
-  // Keep a ref to the latest filters so the polling interval (set up once)
-  // always reads current values instead of a stale closure.
-  const filtersRef = useRef(filters);
-  useEffect(() => { filtersRef.current = filters; }, [filters]);
-
   // Initial load + recurring poll — fetches the full unfiltered VM list each time.
   // Client-side applyVMFilters applies all active filters instantly on the result.
   useEffect(() => {
@@ -1194,9 +1191,11 @@ export default function Dashboard({ onGoToServers, onGoToEmail }) {
     triggerCsvDownload(csv, `hypermonitor_report_${label}_${ts}.csv`);
   };
 
-  // ── Derived KPIs ─────────────────────────────────────────────────────────────
-  const totalVMs      = vms.length;
-  const runningVMs    = vms.filter(v => v.power_state === "running").length;
+  // ── Derived KPIs — filtered VMs drive the counts when a filter is active ─────
+  const filteredVMs   = applyVMFilters(vms, filters);
+  const totalVMs      = (filters.serverId || filters.hypervisorType) ? filteredVMs.length : vms.length;
+  const runningVMs    = ((filters.serverId || filters.hypervisorType) ? filteredVMs : vms)
+                          .filter(v => v.power_state === "running").length;
   const criticalCount = servers.filter(h => h.status === "critical").length;
   const warningCount  = servers.filter(h => h.status === "warning").length;
   const avgCpu        = servers.length
