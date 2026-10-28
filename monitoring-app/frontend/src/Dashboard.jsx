@@ -31,19 +31,11 @@ const POLL_MS = 30000;
 const _IP_RE   = /^(\d{1,3}\.){1,3}\d{0,3}$|^[\da-fA-F:]{2,39}$/;
 const _SLUG_RE = /^[a-z0-9]+-[a-z0-9-]+$/i;
 
-// Return true if `query` matches `text` using these rules:
-//   • If query contains spaces  → substring match (user typed a phrase)
-//   • If query has no spaces    → whole-word match (split on non-alphanumeric
-//                                 boundaries so "web" matches "web server" and
-//                                 "WEB_01" but NOT "webhost" or "sarath_web")
+// Return true if `query` is a substring of `text` (case-insensitive).
 function _textMatch(text, query) {
   const hay = (text || "").toLowerCase();
   const q   = query.toLowerCase();
-  if (q.includes(" ")) return hay.includes(q);           // phrase → substring
-  // Whole-word: split haystack on anything that isn't a letter/digit/dot
-  // then check for an exact token match.
-  const tokens = hay.split(/[^a-z0-9.]+/);
-  return tokens.some(t => t === q);
+  return hay.includes(q);
 }
 
 function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }) {
