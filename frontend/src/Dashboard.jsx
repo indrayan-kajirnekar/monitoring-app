@@ -1,0 +1,1623 @@
+/**
+ * Dashboard.jsx ΓÇö Live monitoring dashboard  v4.0
+ *
+ * Architecture changes:
+ *   ΓÇó Centralized reactive filter state object (Req 2)
+ *     - Single `filters` object drives ALL list rendering ΓÇö no fragmented state.
+ *     - Level 1 (Hypervisor) and Level 2 (Server) dropdowns are bound to it.
+ *     - Changing Level 1 automatically resets Level 2 (cascade reset).
+ *   ΓÇó Client-side VMQueryBuilder mirrors the backend builder for instant feedback (Req 4)
+ *     - Auto-detects IP / slug / free-text and applies the correct OR strategy.
+ *   ΓÇó Snapshotable filter state ΓÇö pass ?hypervisor=X&server=Y in URL? Trivial to add.
+ *   ΓÇó All filter/search logic lives in ONE place: applyFilters().
+ */
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import axios from "axios";
+import { useAuth } from "./AuthContext";
+
+const API     = process.env.REACT_APP_API_URL || "";
+// Poll every 30 s ΓÇö server cache TTL is now 60 s, so one poll per two cycles
+// is enough to stay visually fresh without hammering the backend.
+const POLL_MS = 30000;
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Req 4 ΓÇö Client-side VMQueryBuilder
+// Mirrors the backend query_builder.py logic for instant, zero-latency filtering.
+// The backend endpoint also accepts the same params for server-side pagination
+// on large inventories.
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+const _IP_RE = /^(\d{1,3}\.){1,3}\d{0,3}$|^[\da-fA-F:]{2,39}$/;
+
+// Return true if `query` is a substring of `text` (case-insensitive).
+function _textMatch(text, query) {
+  const hay = (text || "").toLowerCase();
+  const q   = query.toLowerCase();
+  return hay.includes(q);
+}
+
+function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }) {
+  return vms.filter(vm => {
+    // Apply serverId and hypervisorType as independent filters so that selecting
+    // a specific server card (which sets BOTH) correctly narrows by host AND type.
+    if (serverId) {
+      if (String(vm.host_server_id) !== String(serverId)) return false;
+    }
+    if (hypervisorType) {
+      if (vm.hypervisor_type !== hypervisorType) return false;
+    }
+
+    // Power state filter
+    if (powerState && powerState !== "all" && vm.power_state !== powerState) return false;
+
+    // Search filter
+    if (search) {
+      const q = search.trim();
+      if (!q) return true;
+      if (_IP_RE.test(q)) {
+        // IP / prefix ΓÇö substring match on ip_address (192.168.1 style)
+        if (!(vm.ip_address || "").includes(q)) return false;
+      } else {
+        // Word/phrase match across vm_name, owner, purpose, ip, hypervisor
+        const hit = (
+          _textMatch(vm.vm_name,         q) ||
+          _textMatch(vm.owner_name,      q) ||
+          _textMatch(vm.purpose,         q) ||
+          _textMatch(vm.ip_address,      q) ||
+          _textMatch(vm.hypervisor_type, q)
+        );
+        if (!hit) return false;
+      }
+    }
+    return true;
+  });
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Tiny primitives
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+function GaugeBar({ value }) {
+  const pct    = Math.min(100, Math.max(0, Math.round(value)));
+  const colour = pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-400" : "bg-emerald-500";
+  return (
+    <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
+      <div className={`h-2 rounded-full transition-all duration-700 ${colour}`}
+           style={{ width: `${pct}%` }} />
+    </div>
+  );
+}
+
+function HypervisorBadge({ type }) {
+  const p = {
+    "VMware ESXi": "bg-blue-100 text-blue-800",
+    "Ubuntu KVM":  "bg-orange-100 text-orange-800",
+    "Hyper-V":     "bg-purple-100 text-purple-800",
+  };
+  return (
+    <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold
+      ${p[type] ?? "bg-slate-100 text-slate-700"}`}>
+      {type}
+    </span>
+  );
+}
+
+function PowerBadge({ state }) {
+  const s = {
+    running: "bg-emerald-100 text-emerald-700",
+    stopped: "bg-slate-100 text-slate-500",
+    paused:  "bg-amber-100 text-amber-700",
+    unknown: "bg-slate-100 text-slate-400",
+  };
+  return (
+    <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold capitalize
+      ${s[state] ?? s.unknown}`}>
+      {state || "unknown"}
+    </span>
+  );
+}
+
+function StatusDot({ status }) {
+  const c = {
+    online:   "bg-emerald-500",
+    warning:  "bg-amber-400",
+    critical: "bg-red-500",
+    stopped:  "bg-slate-400",
+  };
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className={`inline-block w-2.5 h-2.5 rounded-full ${c[status] ?? "bg-slate-400"}`} />
+      <span className="capitalize text-sm">{status}</span>
+    </span>
+  );
+}
+
+function StatCard({ label, value, sub, accent }) {
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 flex flex-col gap-1">
+      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{label}</p>
+      <p className={`text-3xl font-bold ${accent ?? "text-slate-800"}`}>{value}</p>
+      {sub && <p className="text-xs text-slate-400">{sub}</p>}
+    </div>
+  );
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Drive breakdown row
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+function DriveRow({ drive }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex justify-between text-xs text-slate-500">
+        <span className="font-mono font-medium text-slate-700">{drive.name}</span>
+        <span>
+          {drive.used_gb} / {drive.total_gb} GB
+          <span className="ml-1 text-slate-400">({drive.usage_pct}%)</span>
+        </span>
+      </div>
+      <GaugeBar value={drive.usage_pct} />
+    </div>
+  );
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Snapshot panel ΓÇö expandable row showing per-VM snapshots (Fix 3)
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+function SnapshotPanel({ vmId, vmName, onSnapCount }) {
+  const [snaps,   setSnaps]   = useState(null);   // null=not loaded, []=[]=none
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState(null);
+
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { data } = await axios.get(`${API}/api/vms/${vmId}/snapshots`);
+      setSnaps(data);
+      onSnapCount?.(vmId, data.length);
+    } catch (e) {
+      setError(e?.response?.data?.detail || "Failed to fetch snapshots.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Auto-load on first mount
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (loading) return (
+    <div className="flex items-center gap-2 py-2 text-xs text-slate-400">
+      <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+      </svg>
+      Fetching snapshots from hypervisorΓÇª
+    </div>
+  );
+
+  if (error) return (
+    <div className="flex items-center gap-2 py-2 text-xs text-red-500">
+      ΓÜá {error}
+      <button onClick={load} className="underline text-blue-500 ml-2">Retry</button>
+    </div>
+  );
+
+  if (!snaps) return null;
+
+  if (snaps.length === 0) return (
+    <p className="py-2 text-xs text-slate-400 italic">No snapshots found for <strong>{vmName}</strong>.</p>
+  );
+
+  return (
+    <div className="mt-1">
+      <table className="text-xs w-full">
+        <thead>
+          <tr className="text-slate-400 border-b border-slate-200">
+            <th className="pb-1 pr-4 font-semibold text-left">Snapshot Name</th>
+            <th className="pb-1 pr-4 font-semibold text-left">Created At (UTC)</th>
+            <th className="pb-1 font-semibold text-right">Size</th>
+          </tr>
+        </thead>
+        <tbody>
+          {snaps.map((s, i) => (
+            <tr key={i} className="border-b border-slate-100 last:border-0">
+              <td className="py-1 pr-4 font-mono text-slate-700">{s.snap_name || "ΓÇö"}</td>
+              <td className="py-1 pr-4 text-slate-500">
+                {s.created_at
+                  ? new Date(s.created_at).toLocaleString()
+                  : <span className="text-slate-300">ΓÇö</span>}
+              </td>
+              <td className="py-1 text-right tabular-nums text-slate-500">
+                {s.size_bytes > 0
+                  ? s.size_bytes >= 1073741824
+                    ? `${(s.size_bytes / 1073741824).toFixed(2)} GB`
+                    : `${(s.size_bytes / 1048576).toFixed(0)} MB`
+                  : <span className="text-slate-300">ΓÇö</span>}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <button onClick={load}
+              className="mt-2 text-[10px] text-blue-400 hover:text-blue-600 underline">
+        Γå╗ Refresh snapshots
+      </button>
+    </div>
+  );
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Per-server card  (selectable with checkbox for export)
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+function ServerCard({ server, selected, onSelect, isFilterActive, onCardClick }) {
+  const [showDrives, setShowDrives] = useState(false);
+  const hasDrives = server.drives && server.drives.length > 0;
+  const isStale   = server.cache_age_s != null && server.cache_age_s > 90;
+
+  return (
+    <div
+      className={`bg-white rounded-xl shadow-sm border p-5 flex flex-col gap-3 cursor-pointer
+        ${server.status === "critical"
+          ? "border-red-300"
+          : isFilterActive
+            ? "border-blue-500 ring-2 ring-blue-400 bg-blue-50"
+            : selected
+              ? "border-blue-400 ring-1 ring-blue-300"
+              : "border-slate-200 hover:border-slate-300"}`}
+      onClick={onCardClick}
+      title={isFilterActive ? "Click to remove filter" : "Click to filter VMs by this server"}
+    >
+
+      {/* Header row ΓÇö checkbox + name + status */}
+      <div className="flex items-start gap-2">
+        {/* Selection checkbox */}
+        <input
+          type="checkbox"
+          checked={selected}
+          onClick={e => e.stopPropagation()}
+          onChange={e => onSelect(server.server_id, e.target.checked)}
+          className="mt-1 h-3.5 w-3.5 rounded border-slate-300 text-blue-600
+            focus:ring-blue-400 cursor-pointer shrink-0"
+        />
+        <div className="flex-1 min-w-0">
+          <p className="font-semibold text-slate-800 text-sm truncate" title={server.display_name}>
+            {server.display_name}
+          </p>
+          {isFilterActive && (
+            <span className="inline-block text-[10px] font-semibold text-blue-600 bg-blue-100 border border-blue-200 rounded px-1.5 py-0.5 mt-0.5">
+              Active Filter
+            </span>
+          )}
+          <p className="text-xs text-slate-400 font-mono">{server.ip_address}</p>
+        </div>
+        <div className="flex flex-col items-end gap-1">
+          <StatusDot status={server.status} />
+          {server.cache_age_s != null && (
+            <span className={`text-[10px] tabular-nums ${isStale ? "text-amber-500 font-semibold" : "text-slate-300"}`}>
+              {isStale ? "ΓÜá " : ""}polled {Math.round(server.cache_age_s)}s ago
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <HypervisorBadge type={server.hypervisor_type} />
+        {server.cpu_cores > 0 && (
+          <span className="text-xs text-slate-500">{server.cpu_cores} CPUs</span>
+        )}
+        <span className="text-xs text-slate-400 ml-auto">{server.vm_count} VMs</span>
+      </div>
+
+      {/* CPU */}
+      <div>
+        <div className="flex justify-between text-xs text-slate-500 mb-1">
+          <span>CPU</span>
+          <span className="font-medium text-slate-700">{server.cpu_usage_pct}%</span>
+        </div>
+        <GaugeBar value={server.cpu_usage_pct} />
+      </div>
+
+      {/* RAM */}
+      <div>
+        <div className="flex justify-between text-xs text-slate-500 mb-1">
+          <span>RAM</span>
+          <span className="font-medium text-slate-700">
+            {server.ram_used_gb} / {server.ram_total_gb} GB
+            <span className="ml-1 text-slate-400">({server.ram_usage_pct}%)</span>
+          </span>
+        </div>
+        <GaugeBar value={server.ram_usage_pct} />
+      </div>
+
+      {/* Storage ΓÇö aggregate gauge + optional per-drive breakdown */}
+      <div>
+        <div className="flex justify-between text-xs text-slate-500 mb-1">
+          <span className="flex items-center gap-1">
+            Storage
+            {hasDrives && (
+              <button
+                onClick={e => { e.stopPropagation(); setShowDrives(d => !d); }}
+                className="text-blue-500 hover:text-blue-700 ml-1 text-[10px] font-semibold">
+                {showDrives ? "Γû▓ hide" : `Γû╝ ${server.drives.length} drive${server.drives.length > 1 ? "s" : ""}`}
+              </button>
+            )}
+          </span>
+          <span className="font-medium text-slate-700">
+            {server.storage_used_tb} / {server.storage_total_tb} TB
+            <span className="ml-1 text-slate-400">({server.storage_usage_pct}%)</span>
+          </span>
+        </div>
+        <GaugeBar value={server.storage_usage_pct} />
+
+        {showDrives && hasDrives && (
+          <div className="mt-2 flex flex-col gap-1.5 pl-2 border-l-2 border-slate-100">
+            {server.drives.map((d, i) => <DriveRow key={i} drive={d} />)}
+          </div>
+        )}
+      </div>
+
+      {server.error && (
+        <p className="text-xs text-red-500 bg-red-50 border border-red-100 rounded px-2 py-1 break-words">
+          ΓÜá {server.error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Presentation CSV builder  (client-side, UTF-8 BOM, Excel-ready)
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+function buildPresentationCsv(servers, vms) {
+  const now       = new Date().toUTCString();
+  const totalVMs  = vms.length;
+  const runningVMs = vms.filter(v => v.power_state === "running").length;
+  const critCt    = servers.filter(s => s.status === "critical").length;
+  const warnCt    = servers.filter(s => s.status === "warning").length;
+  const avgCpu    = servers.length
+    ? (servers.reduce((s, h) => s + h.cpu_usage_pct, 0) / servers.length).toFixed(1)
+    : 0;
+
+  // Build a quick lookup: server_id ΓåÆ server object
+  const serverMap = Object.fromEntries(servers.map(s => [s.server_id, s]));
+
+  const esc = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const row = cols => cols.map(esc).join(",") + "\n";
+
+  let csv = "";
+
+  // ΓöÇΓöÇ Executive summary block ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  csv += "HYPERMONITOR ΓÇö INFRASTRUCTURE DASHBOARD REPORT\n";
+  csv += `Generated:,${now}\n`;
+  csv += "\n";
+  csv += "EXECUTIVE SUMMARY\n";
+  csv += `Total Hypervisor Hosts,${servers.length}\n`;
+  csv += `Total Virtual Machines,${totalVMs}\n`;
+  csv += `Running VMs,${runningVMs}\n`;
+  csv += `Average CPU Utilisation,${avgCpu}%\n`;
+  csv += `Hosts in Critical State,${critCt}\n`;
+  csv += `Hosts in Warning State,${warnCt}\n`;
+  csv += `Hosts Online,${servers.length - critCt - warnCt}\n`;
+  csv += "\n";
+
+  // ΓöÇΓöÇ Server utilisation table ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  csv += "HOST UTILISATION DETAIL\n";
+  csv += row(["Host Name", "IP Address", "Hypervisor", "CPU %", "CPU Cores",
+              "RAM Used (GB)", "RAM Total (GB)", "RAM %",
+              "Storage Used (TB)", "Storage Total (TB)", "Storage %",
+              "VM Count", "Status"]);
+  for (const s of servers) {
+    csv += row([s.display_name, s.ip_address, s.hypervisor_type,
+                s.cpu_usage_pct, s.cpu_cores,
+                s.ram_used_gb, s.ram_total_gb, s.ram_usage_pct,
+                s.storage_used_tb, s.storage_total_tb, s.storage_usage_pct,
+                s.vm_count, (s.status || "").toUpperCase()]);
+  }
+  csv += "\n";
+
+  // ΓöÇΓöÇ VM inventory table ΓÇö matches all columns shown in the VM Inventory UI ΓöÇ
+  csv += "VM INVENTORY DETAIL\n";
+  csv += row(["VM Name", "IP Address", "Hypervisor Type", "Host Server", "Host IP",
+              "Power State", "CPU %", "vCPUs", "RAM Used (GB)", "RAM Total (GB)", "RAM %",
+              "Snapshots", "Owner", "Creation Date", "Purpose", "Status"]);
+  for (const v of vms) {
+    const host = serverMap[v.host_server_id];
+    csv += row([v.vm_name, v.ip_address, v.hypervisor_type,
+                host ? host.display_name : v.host_server_id,
+                host ? host.ip_address : "",
+                (v.power_state || "").toUpperCase(),
+                v.cpu_usage_pct, v.cpu_cores,
+                v.ram_used_gb, v.ram_total_gb, v.ram_usage_pct,
+                v.snapshot_count ?? 0,
+                v.owner_name, v.creation_date, v.purpose,
+                (v.status || "").toUpperCase()]);
+  }
+
+  // UTF-8 BOM so Excel auto-detects encoding
+  return "\uFEFF" + csv;
+}
+
+function buildPresentationHtml(servers, vms) {
+  const now = new Date().toUTCString();
+  const serverMap = Object.fromEntries(servers.map(s => [s.server_id, s]));
+  const runningVMs = vms.filter(v => v.power_state === "running").length;
+  const stoppedVMs = vms.filter(v => v.power_state === "stopped").length;
+
+  const esc = v => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  const powerColour = state => {
+    if (state === "running") return "color:#15803d;font-weight:600";
+    if (state === "stopped") return "color:#6b7280";
+    if (state === "paused")  return "color:#d97706;font-weight:600";
+    return "";
+  };
+
+  const vmRows = vms.map(v => {
+    const host = serverMap[v.host_server_id];
+    return `<tr>
+      <td>${esc(v.vm_name)}</td>
+      <td style="font-family:monospace">${esc(v.ip_address)}</td>
+      <td>${esc(v.hypervisor_type)}</td>
+      <td>${host ? esc(host.display_name) : esc(v.host_server_id)}<br/><span style="color:#9ca3af;font-size:11px">${host ? esc(host.ip_address) : ""}</span></td>
+      <td style="${powerColour(v.power_state)}">${esc((v.power_state || "").toUpperCase())}</td>
+      <td>${esc(v.cpu_usage_pct)}%</td>
+      <td>${esc(v.cpu_cores)}</td>
+      <td>${esc(v.ram_used_gb)} / ${esc(v.ram_total_gb)} GB<br/><span style="color:#9ca3af;font-size:11px">${esc(v.ram_usage_pct)}%</span></td>
+      <td>${esc(v.snapshot_count ?? 0)}</td>
+      <td>${esc(v.owner_name)}</td>
+      <td style="font-size:11px">${esc(v.creation_date)}</td>
+      <td>${esc(v.purpose)}</td>
+    </tr>`;
+  }).join("");
+
+  const serverRows = servers.map(s => `<tr>
+    <td>${esc(s.display_name)}</td>
+    <td style="font-family:monospace">${esc(s.ip_address)}</td>
+    <td>${esc(s.hypervisor_type)}</td>
+    <td>${esc(s.cpu_usage_pct)}%</td>
+    <td>${esc(s.cpu_cores)}</td>
+    <td>${esc(s.ram_used_gb)} / ${esc(s.ram_total_gb)} GB (${esc(s.ram_usage_pct)}%)</td>
+    <td>${esc(s.storage_used_tb)} / ${esc(s.storage_total_tb)} TB (${esc(s.storage_usage_pct)}%)</td>
+    <td>${esc(s.vm_count)}</td>
+    <td style="text-transform:uppercase">${esc(s.status)}</td>
+  </tr>`).join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>HyperMonitor Report</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; font-size:13px; color:#1f2328; margin:0; padding:24px; background:#f7f8fa }
+  h1 { font-size:20px; margin:0 0 4px } .sub { color:#6b7280; font-size:12px; margin-bottom:24px }
+  h2 { font-size:14px; font-weight:600; margin:28px 0 8px; color:#374151 }
+  .kpi { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:28px }
+  .kpi-card { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:12px 20px; min-width:140px }
+  .kpi-val { font-size:22px; font-weight:700; color:#1f2328 }
+  .kpi-lbl { font-size:11px; color:#6b7280; margin-top:2px }
+  table { width:100%; border-collapse:collapse; background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.06); margin-bottom:28px }
+  thead { background:#f1f5f9 }
+  th { padding:8px 10px; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:#64748b; white-space:nowrap }
+  td { padding:7px 10px; border-top:1px solid #f1f5f9; vertical-align:middle; font-size:12px }
+  tr:hover td { background:#fafafa }
+  .footer { margin-top:32px; font-size:11px; color:#9ca3af; text-align:center; padding-top:12px; border-top:1px solid #e5e7eb }
+</style>
+</head>
+<body>
+<h1>HyperMonitor ΓÇö Infrastructure Report</h1>
+<p class="sub">Generated: ${esc(now)}</p>
+
+<div class="kpi">
+  <div class="kpi-card"><div class="kpi-val">${servers.length}</div><div class="kpi-lbl">Total Hosts</div></div>
+  <div class="kpi-card"><div class="kpi-val">${vms.length}</div><div class="kpi-lbl">Total VMs</div></div>
+  <div class="kpi-card"><div class="kpi-val" style="color:#15803d">${runningVMs}</div><div class="kpi-lbl">Running VMs</div></div>
+  <div class="kpi-card"><div class="kpi-val" style="color:#6b7280">${stoppedVMs}</div><div class="kpi-lbl">Stopped VMs</div></div>
+</div>
+
+<h2>Host Utilisation</h2>
+<table>
+<thead><tr>
+  <th>Host Name</th><th>IP Address</th><th>Hypervisor</th><th>CPU %</th><th>CPU Cores</th>
+  <th>RAM</th><th>Storage</th><th>VMs</th><th>Status</th>
+</tr></thead>
+<tbody>${serverRows}</tbody>
+</table>
+
+<h2>VM Inventory</h2>
+<table>
+<thead><tr>
+  <th>VM Name</th><th>IP</th><th>Hypervisor</th><th>Host Server</th><th>Power</th>
+  <th>CPU %</th><th>vCPUs</th><th>RAM</th><th>Snaps</th>
+  <th>Owner</th><th>Created</th><th>Purpose</th>
+</tr></thead>
+<tbody>${vmRows}</tbody>
+</table>
+
+<div class="footer">HyperMonitor ┬╖ ${esc(now)}</div>
+</body>
+</html>`;
+}
+
+function triggerHtmlDownload(content, filename) {
+  const blob = new Blob([content], { type: "text/html;charset=utf-8;" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function triggerCsvDownload(content, filename) {
+  const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// VM Inventory Table  ΓÇö driven by centralized filters prop (Req 2)
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+/**
+ * VMTable props
+ * ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ * vms         ΓÇô full unfiltered VM list from the API
+ * filters     ΓÇô centralized filter state object from Dashboard
+ *               { hypervisorType, serverId, powerState, search }
+ * onFilters   ΓÇô setState setter for filters (used for search + power pill)
+ * onVmsUpdated ΓÇô callback after a successful inline metadata save
+ */
+function VMTable({ vms, filters, onFilters, onVmsUpdated, servers = [],
+                   snapCounts = {}, onSnapCount }) {
+  const [sortKey,  setSortKey]  = useState("vm_name");
+  const [sortAsc,  setSortAsc]  = useState(true);
+  // Which vm_ids have their snapshot panel expanded
+  const [snapOpen, setSnapOpen] = useState({});
+  const toggleSnap = (vmId) => setSnapOpen(s => ({ ...s, [vmId]: !s[vmId] }));
+
+  // Inline edit state: { [vm_id]: { owner_name, purpose } }
+  const [edits,  setEdits]  = useState({});
+  const [saving, setSaving] = useState({});
+
+  const isDirty = vm =>
+    edits[vm.vm_id] &&
+    (edits[vm.vm_id].owner_name !== vm.owner_name ||
+     edits[vm.vm_id].purpose    !== vm.purpose);
+
+  const getEdit = (vm, field) =>
+    edits[vm.vm_id] ? edits[vm.vm_id][field] : vm[field];
+
+  const setEdit = (vm, field, value) =>
+    setEdits(e => ({
+      ...e,
+      [vm.vm_id]: {
+        owner_name: e[vm.vm_id]?.owner_name ?? vm.owner_name,
+        purpose:    e[vm.vm_id]?.purpose    ?? vm.purpose,
+        [field]: value,
+      },
+    }));
+
+  const saveRow = async (vm) => {
+    if (!isDirty(vm)) return;
+    setSaving(s => ({ ...s, [vm.vm_id]: true }));
+    try {
+      await axios.put(`${API}/api/vms/metadata/${vm.vm_id}`, {
+        vm_id:           vm.vm_id,
+        vm_name:         vm.vm_name,
+        ip_address:      vm.ip_address,
+        hypervisor_type: vm.hypervisor_type,
+        owner_name:      edits[vm.vm_id]?.owner_name ?? vm.owner_name,
+        creation_date:   vm.creation_date,
+        purpose:         edits[vm.vm_id]?.purpose    ?? vm.purpose,
+      });
+      setEdits(e => { const n = { ...e }; delete n[vm.vm_id]; return n; });
+      onVmsUpdated?.();
+    } catch { /* leave edits so user can retry */ }
+    finally { setSaving(s => { const n = { ...s }; delete n[vm.vm_id]; return n; }); }
+  };
+
+  const handleSort = (key) => {
+    if (key === sortKey) setSortAsc(a => !a);
+    else { setSortKey(key); setSortAsc(true); }
+  };
+
+  // ΓöÇΓöÇ Apply centralized filters ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const displayed = useMemo(() =>
+    applyVMFilters(vms, filters)
+      .sort((a, b) => {
+        const av = a[sortKey], bv = b[sortKey];
+        const cmp = typeof av === "number" ? av - bv : String(av).localeCompare(String(bv));
+        return sortAsc ? cmp : -cmp;
+      }),
+    [vms, filters, sortKey, sortAsc]
+  );
+
+  // Counts based on the filtered result so the header matches what's visible
+  const running    = displayed.filter(v => v.power_state === "running").length;
+  const stopped    = displayed.filter(v => v.power_state === "stopped").length;
+  const dirtyCount = Object.keys(edits).length;
+
+  const Th = ({ label, col }) => (
+    <th onClick={() => handleSort(col)}
+        className="px-3 py-3 text-left text-xs font-semibold uppercase tracking-wider
+          text-slate-500 cursor-pointer select-none whitespace-nowrap hover:text-slate-800">
+      {label}
+      {sortKey === col && <span className="ml-1 text-blue-500">{sortAsc ? "Γû▓" : "Γû╝"}</span>}
+    </th>
+  );
+
+  return (
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+      {/* Toolbar ΓÇö all filter controls bound to centralized `filters` state (Req 2) */}
+      <div className="px-5 py-4 border-b border-slate-100 flex flex-col sm:flex-row gap-3
+                      items-start sm:items-center justify-between">
+        <div className="flex items-center gap-3 flex-wrap">
+          <h2 className="font-semibold text-slate-800">VM Inventory</h2>
+          <span className="text-xs text-slate-400">
+            {running} running ┬╖ {stopped} stopped ┬╖ {displayed.length} of {vms.length} total
+          </span>
+          {/* Power state filter pills ΓÇö write directly into centralized filters */}
+          <div className="flex gap-1">
+            {["all", "running", "stopped", "paused"].map(p => (
+              <button key={p}
+                      onClick={() => onFilters(f => ({ ...f, powerState: p }))}
+                      className={`text-xs px-2 py-0.5 rounded-full font-medium capitalize
+                        ${(filters.powerState || "all") === p
+                          ? "bg-slate-700 text-white"
+                          : "bg-slate-100 text-slate-500 hover:bg-slate-200"}`}>
+                {p}
+              </button>
+            ))}
+          </div>
+          {dirtyCount > 0 && (
+            <span className="text-xs bg-amber-100 text-amber-700 border border-amber-300
+              px-2 py-0.5 rounded-full font-semibold animate-pulse">
+              {dirtyCount} unsaved change{dirtyCount > 1 ? "s" : ""}
+            </span>
+          )}
+        </div>
+        <div className="flex gap-2 items-center flex-wrap">
+          {/* Search ΓÇö auto-detects IP / slug / free-text via applyVMFilters */}
+          <input type="text"
+                 placeholder="Search VMs, IPs, ownersΓÇª"
+                 value={filters.search || ""}
+                 onChange={e => onFilters(f => ({ ...f, search: e.target.value }))}
+                 className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-full sm:w-64
+                   focus:outline-none focus:ring-2 focus:ring-blue-400" />
+          {filters.search && (
+            <button onClick={() => onFilters(f => ({ ...f, search: "" }))}
+                    className="text-xs text-slate-400 hover:text-slate-700 underline whitespace-nowrap">
+              Γ£ò clear
+            </button>
+          )}
+          {/* Download HTML report of currently displayed VMs */}
+          <button
+            onClick={() => {
+              const ts = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "");
+              triggerHtmlDownload(buildPresentationHtml(servers, displayed), `vm_inventory_${ts}.html`);
+            }}
+            title="Download HTML report of displayed VMs"
+            className="flex items-center gap-1 text-xs font-semibold border border-violet-400
+              text-violet-700 px-2.5 py-1.5 rounded-lg hover:bg-violet-50 whitespace-nowrap">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            HTML
+          </button>
+          {/* Download CSV report of currently displayed VMs */}
+          <button
+            onClick={() => {
+              const ts = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "");
+              triggerCsvDownload(buildPresentationCsv(servers, displayed), `vm_inventory_${ts}.csv`);
+            }}
+            title="Download CSV report of displayed VMs"
+            className="flex items-center gap-1 text-xs font-semibold border border-emerald-400
+              text-emerald-700 px-2.5 py-1.5 rounded-lg hover:bg-emerald-50 whitespace-nowrap">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            CSV
+          </button>
+        </div>
+      </div>
+
+      {/* Active filter status banner ΓÇö shows which server/hypervisor filter is active */}
+      {(filters.serverId || filters.hypervisorType) && (
+        <div className="px-5 py-2 bg-amber-50 border-b border-amber-200 flex items-center gap-2 text-xs text-amber-800">
+          <svg className="w-3.5 h-3.5 shrink-0 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707L13 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 017 21v-7.586L3.293 6.707A1 1 0 013 6V4z"/>
+          </svg>
+          <span>
+            Filtered by:
+            {filters.hypervisorType && (
+              <strong className="ml-1">{filters.hypervisorType}</strong>
+            )}
+            {filters.serverId && (
+              <strong className="ml-1">
+                {" ΓÇö "}{servers.find(s => String(s.server_id) === String(filters.serverId))?.display_name || filters.serverId}
+              </strong>
+            )}
+            <span className="ml-2 text-amber-600">
+              ΓÇö showing {displayed.length} of {vms.length} VMs
+            </span>
+          </span>
+          <button
+            onClick={() => onFilters(f => ({ ...f, hypervisorType: "", serverId: "" }))}
+            className="ml-auto text-amber-600 hover:text-amber-900 underline font-semibold">
+            Γ£ò clear filter
+          </button>
+        </div>
+      )}
+
+      {/* Inline-edit hint banner */}
+      <div className="px-5 py-2 bg-blue-50 border-b border-blue-100 flex items-center gap-2 text-xs text-blue-700">
+        <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round"
+                d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+        </svg>
+        Click any <strong>Owner</strong> or <strong>Purpose</strong> cell to edit inline, then press
+        <kbd className="mx-1 px-1 py-0.5 bg-blue-100 rounded font-mono text-[10px]">Enter</kbd>
+        or click <strong>Save</strong> to persist.
+      </div>
+
+      {/* Table */}
+      <div className="overflow-x-auto">
+        <table className="min-w-full divide-y divide-slate-100">
+          <thead className="bg-slate-50">
+            <tr>
+              <Th label="VM Name"    col="vm_name" />
+              <Th label="IP"         col="ip_address" />
+              <Th label="Hypervisor" col="hypervisor_type" />
+              <Th label="Power"      col="power_state" />
+              <Th label="CPU %"      col="cpu_usage_pct" />
+              <Th label="vCPUs"      col="cpu_cores" />
+              <Th label="RAM Used"   col="ram_used_gb" />
+              <Th label="RAM Total"  col="ram_total_gb" />
+              {/* Owner / Purpose are editable ΓÇö shown with pencil icon */}
+              <th className="px-3 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500 whitespace-nowrap">
+                Owner
+                <span className="ml-1 text-slate-300">Γ£Ä</span>
+              </th>
+              <Th label="Created"    col="creation_date" />
+              <th className="px-3 py-3 text-left text-xs font-semibold uppercase tracking-wider text-slate-500 whitespace-nowrap">
+                Purpose
+                <span className="ml-1 text-slate-300">Γ£Ä</span>
+              </th>
+              {/* Merged Snapshots column ΓÇö count badge is the expand toggle */}
+              <th className="px-3 py-3 text-center text-xs font-semibold uppercase tracking-wider text-slate-500 whitespace-nowrap w-28">
+                Snapshots
+              </th>
+              {/* Save column ΓÇö only visible when a row is dirty */}
+              <th className="px-3 py-3 w-16" />
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-50">
+            {displayed.length === 0 ? (
+              <tr>
+                <td colSpan={12} className="text-center py-12 text-slate-400 text-sm">
+                  No VMs match your filter.
+                </td>
+              </tr>
+            ) : displayed.map(vm => {
+              const dirty = isDirty(vm);
+              const hostServer = servers.find(s => s.server_id === vm.host_server_id);
+              return (
+                <React.Fragment key={vm.vm_id}>
+                <tr
+                    className={`transition-colors ${dirty ? "bg-amber-50" : "hover:bg-slate-50"}`}>
+                  <td className="px-3 py-2 text-sm font-medium text-slate-800 whitespace-nowrap">
+                    {vm.vm_name}
+                  </td>
+                  <td className="px-3 py-2 text-xs text-slate-500 font-mono whitespace-nowrap">
+                    {vm.ip_address || <span className="text-slate-300">ΓÇö</span>}
+                  </td>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    <div className="flex flex-col">
+                      <HypervisorBadge type={vm.hypervisor_type} />
+                      {hostServer && (
+                        <span className="text-[11px] text-slate-500 mt-0.5" title="Hosted on">
+                          {hostServer.display_name} ({hostServer.ip_address})
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 whitespace-nowrap">
+                    <PowerBadge state={vm.power_state} />
+                  </td>
+                  <td className="px-3 py-2 text-sm text-slate-700 whitespace-nowrap">
+                    <div className="flex items-center gap-1.5">
+                      <span className="w-9 text-right tabular-nums">{vm.cpu_usage_pct}%</span>
+                      <div className="w-14"><GaugeBar value={vm.cpu_usage_pct} /></div>
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 text-sm text-slate-600 whitespace-nowrap text-center">
+                    {vm.cpu_cores}
+                  </td>
+                  <td className="px-3 py-2 text-sm text-slate-700 whitespace-nowrap tabular-nums">
+                    {vm.ram_used_gb} GB
+                  </td>
+                  <td className="px-3 py-2 text-sm text-slate-500 whitespace-nowrap tabular-nums">
+                    {vm.ram_total_gb} GB
+                    <div className="w-14 mt-0.5"><GaugeBar value={vm.ram_usage_pct} /></div>
+                  </td>
+
+                  {/* ΓöÇΓöÇ Inline-editable Owner ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+                  <td className="px-2 py-1.5 whitespace-nowrap min-w-[130px]">
+                    <input
+                      value={getEdit(vm, "owner_name")}
+                      onChange={e => setEdit(vm, "owner_name", e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && saveRow(vm)}
+                      placeholder="Owner"
+                      className={`w-full text-sm px-2 py-1 rounded border transition-colors
+                        focus:outline-none focus:ring-2 focus:ring-blue-400
+                        ${dirty
+                          ? "border-amber-400 bg-amber-50"
+                          : "border-transparent bg-transparent hover:border-slate-300 hover:bg-white"}`}
+                    />
+                  </td>
+
+                  <td className="px-3 py-2 text-xs text-slate-500 whitespace-nowrap">
+                    {vm.creation_date}
+                  </td>
+
+                  {/* ΓöÇΓöÇ Inline-editable Purpose ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+                  <td className="px-2 py-1.5 min-w-[160px]">
+                    <input
+                      value={getEdit(vm, "purpose")}
+                      onChange={e => setEdit(vm, "purpose", e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && saveRow(vm)}
+                      placeholder="Purpose"
+                      className={`w-full text-xs px-2 py-1 rounded border transition-colors
+                        focus:outline-none focus:ring-2 focus:ring-blue-400
+                        ${dirty
+                          ? "border-amber-400 bg-amber-50"
+                          : "border-transparent bg-transparent hover:border-slate-300 hover:bg-white"}`}
+                    />
+                  </td>
+
+                  {/* ΓöÇΓöÇ Merged Snapshots column: count badge = expand toggle ΓöÇΓöÇ */}
+                  <td className="px-3 py-2 whitespace-nowrap text-center w-28">
+                    {(() => {
+                      const count = snapCounts[vm.vm_id] ?? vm.snapshot_count;
+                      const isOpen = snapOpen[vm.vm_id];
+                      const hasCount = count > 0;
+                      const confirmed0 = snapCounts[vm.vm_id] === 0;
+                      return (
+                        <button
+                          onClick={() => toggleSnap(vm.vm_id)}
+                          title={isOpen ? "Hide snapshots" : "Show snapshots"}
+                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs
+                            font-semibold border transition-colors
+                            ${isOpen
+                              ? "bg-indigo-100 text-indigo-700 border-indigo-300"
+                              : hasCount
+                                ? "bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100"
+                                : "bg-slate-50 text-slate-400 border-slate-200 hover:bg-slate-100 hover:text-slate-600"
+                            }`}>
+                          <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24"
+                               stroke="currentColor" strokeWidth={2}>
+                            <path strokeLinecap="round" strokeLinejoin="round"
+                                  d="M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M9 3h6M9 3a1 1 0 00-1 1v1h8V4a1 1 0 00-1-1H9z"/>
+                          </svg>
+                          <span>
+                            {hasCount
+                              ? `${count} ${count === 1 ? "snap" : "snaps"}`
+                              : confirmed0 ? "0 snaps" : "Snaps"}
+                          </span>
+                          <span className="text-[9px] opacity-60">{isOpen ? "Γû▓" : "Γû╝"}</span>
+                        </button>
+                      );
+                    })()}
+                  </td>
+
+                  {/* ΓöÇΓöÇ Save / spinner button (only when dirty) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+                  <td className="px-2 py-1.5 whitespace-nowrap w-16">
+                    {dirty && (
+                      saving[vm.vm_id]
+                        ? <svg className="animate-spin h-4 w-4 text-blue-500 mx-auto"
+                               viewBox="0 0 24 24" fill="none">
+                            <circle className="opacity-25" cx="12" cy="12" r="10"
+                                    stroke="currentColor" strokeWidth="4"/>
+                            <path className="opacity-75" fill="currentColor"
+                                  d="M4 12a8 8 0 018-8v8H4z"/>
+                          </svg>
+                        : <button
+                            onClick={() => saveRow(vm)}
+                            className="text-xs px-2 py-1 rounded bg-blue-600 text-white
+                              hover:bg-blue-700 font-semibold transition-colors w-full">
+                            Save
+                          </button>
+                    )}
+                  </td>
+                </tr>
+                {/* ΓöÇΓöÇ Expandable snapshot panel row ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+                {snapOpen[vm.vm_id] && (
+                  <tr className="bg-indigo-50/40">
+                    <td colSpan={14} className="px-6 py-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <svg className="w-3.5 h-3.5 text-indigo-400" fill="none"
+                             viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round"
+                                d="M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7M9 3h6M9 3a1 1 0 00-1 1v1h8V4a1 1 0 00-1-1H9z"/>
+                        </svg>
+                        <span className="text-xs font-semibold text-indigo-600">
+                          Snapshots ΓÇö {vm.vm_name}
+                        </span>
+                      </div>
+                      <SnapshotPanel vmId={vm.vm_id} vmName={vm.vm_name} onSnapCount={onSnapCount} />
+                    </td>
+                  </tr>
+                )}
+                </React.Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="px-5 py-3 border-t border-slate-100 text-xs text-slate-400">
+        {(filters.serverId || filters.hypervisorType)
+          ? <>Showing <strong className="text-slate-600">{displayed.length}</strong> filtered VM{displayed.length !== 1 ? "s" : ""} (of {vms.length} total)</>
+          : <>Showing {displayed.length} of {vms.length} VMs</>
+        }
+        {dirtyCount > 0 && (
+          <span className="ml-3 text-amber-600">
+            ΓÇö {dirtyCount} row{dirtyCount > 1 ? "s" : ""} have unsaved edits
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Main Dashboard
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// CENTRALIZED FILTER STATE (Req 2)
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+//
+// All filtering is driven by a single `filters` object.
+// Components read from it and write back via setFilters (functional updates).
+//
+// Shape:
+//   {
+//     hypervisorType: string | ""   ΓåÉ Level 1 dropdown
+//     serverId:       string | ""   ΓåÉ Level 2 dropdown (cascades from L1)
+//     powerState:     string | "all"
+//     search:         string        ΓåÉ smart global search
+//   }
+//
+// Rules:
+//   - Changing hypervisorType always resets serverId (cascade reset).
+//   - The Level 2 server dropdown only shows servers of the selected hypervisor.
+//   - All filters compose via logical AND through applyVMFilters().
+
+const EMPTY_FILTERS = {
+  hypervisorType: "",
+  serverId:       "",
+  powerState:     "all",
+  search:         "",
+};
+
+export default function Dashboard({ onGoToServers, onGoToEmail }) {
+  const { permissions } = useAuth();
+
+  const [servers,     setServers]     = useState([]);
+  const [vms,         setVms]         = useState([]);
+  const [hypervisors, setHypervisors] = useState([]);
+  // Snapshot counts keyed by vm_id ΓÇö seeded from DB on load, updated live by panel
+  const [snapCounts,  setSnapCounts]  = useState({});
+  const handleSnapCount = useCallback((vmId, count) =>
+    setSnapCounts(c => ({ ...c, [vmId]: count })), []);
+  const [loading,     setLoading]     = useState(true);
+  const [fetching,    setFetching]    = useState(false);
+  const [refreshing,  setRefreshing]  = useState(false);
+  const [sending,     setSending]     = useState(false);
+  const [sendMsg,     setSendMsg]     = useState("");
+  const [sendFmt,     setSendFmt]     = useState("both"); // "html" | "csv" | "both"
+  const [error,       setError]       = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+
+  // ΓöÇΓöÇ Centralized reactive filter state (Req 2) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const [filters,    setFilters]     = useState(EMPTY_FILTERS);
+
+  // Selected server IDs for export
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const intervalRef = useRef(null);
+
+  // ΓöÇΓöÇ Level 2 server list ΓÇö only servers matching the selected hypervisor ΓöÇΓöÇΓöÇΓöÇ
+  const l2Servers = useMemo(
+    () => filters.hypervisorType
+      ? servers.filter(s => s.hypervisor_type === filters.hypervisorType)
+      : servers,
+    [servers, filters.hypervisorType]
+  );
+
+  // ΓöÇΓöÇ Cascade reset: changing L1 clears L2 and powerState ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const setHypervisorFilter = (hvType) => {
+    setFilters(f => ({
+      ...f,
+      hypervisorType: hvType,
+      serverId:       "",    // always reset Level 2 when Level 1 changes
+    }));
+  };
+
+  // ΓöÇΓöÇ Select or toggle server filter from card click ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const handleServerCardClick = (server) => {
+    setFilters(f => {
+      if (f.serverId === server.server_id) {
+        // Deselect: clear both server and hypervisor filters, keep search/power
+        return {
+          ...f,
+          hypervisorType: "",
+          serverId:       "",
+        };
+      } else {
+        // Select: pin to this exact server, clear search to avoid stale interference
+        return {
+          ...f,
+          hypervisorType: server.hypervisor_type,
+          serverId:       server.server_id,
+          search:         "",
+        };
+      }
+    });
+  };
+
+  // Tracks the in-flight /api/vms request so a slow, stale request can be
+  // aborted the instant a newer server/hypervisor selection is made ΓÇö
+  // preventing a race condition where an old response overwrites new state.
+  const vmAbortRef = useRef(null);
+
+  const fetchAll = useCallback(async (isBackground = false) => {
+    if (isBackground) setFetching(true);
+
+    // Cancel any previous /api/vms request that hasn't resolved yet.
+    if (vmAbortRef.current) vmAbortRef.current.abort();
+    const controller = new AbortController();
+    vmAbortRef.current = controller;
+
+    try {
+      // Always fetch the FULL unfiltered VM list from the API.
+      // All filtering (hypervisor, server, power state, search) is done
+      // entirely client-side by applyVMFilters in VMTable.
+      // This eliminates the dual-filter bug where server-side filtering
+      // returned a stale subset that client-side filters then ran on top of,
+      // causing wrong VMs to appear or valid VMs to go missing.
+      const [sRes, vRes, hRes, cRes] = await Promise.all([
+        axios.get(`${API}/api/servers`),
+        axios.get(`${API}/api/vms`, { signal: controller.signal }),
+        axios.get(`${API}/api/hypervisors`),
+        axios.get(`${API}/api/snapshots/counts`),
+      ]);
+      setServers(sRes.data);
+      setVms(vRes.data);
+      setHypervisors(hRes.data);
+      // Seed snapshot counts from DB; panel expansions will override with live counts
+      setSnapCounts(prev => ({ ...prev, ...cRes.data }));
+      setLastUpdated(new Date().toLocaleTimeString());
+      setError(null);
+    } catch (err) {
+      // A newer request superseded this one ΓÇö not a real error, ignore.
+      if (axios.isCancel(err) || err?.code === "ERR_CANCELED") return;
+      const status = err?.response?.status;
+      if (status === 403) {
+        setError("Permission denied ΓÇö your account needs the 'dashboard_view' permission. Ask an Administrator to assign you to a group (e.g. Team, Leads, or Administrator).");
+      } else if (status === 401) {
+        // axios interceptor in AuthContext will clear token and redirect to login
+        setError("Session expired. Please log in again.");
+      } else {
+        setError("Unable to reach the API. RetryingΓÇª");
+      }
+    } finally {
+      setLoading(false);
+      setFetching(false);
+    }
+  }, []);
+
+  // Initial load + recurring poll ΓÇö fetches the full unfiltered VM list each time.
+  // Client-side applyVMFilters applies all active filters instantly on the result.
+  useEffect(() => {
+    fetchAll(false);
+    intervalRef.current = setInterval(() => fetchAll(true), POLL_MS);
+    return () => clearInterval(intervalRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fetchAll]);
+
+  // No separate re-fetch needed when filters change ΓÇö filtering is now 100%
+  // client-side, so changing any filter is instant with no API round-trip.
+
+  // ΓöÇΓöÇ Permission guard ΓÇö show a clear message before any API calls ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  if (permissions && permissions.dashboard_view === false) {
+    return (
+      <div className="rounded-xl bg-amber-50 border border-amber-200 p-8 text-center text-amber-800 text-sm max-w-lg mx-auto mt-16">
+        <svg className="w-10 h-10 mx-auto mb-3 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+          <path strokeLinecap="round" strokeLinejoin="round"
+                d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+        </svg>
+        <p className="font-bold text-base mb-1">Dashboard access not granted</p>
+        <p className="text-amber-700">Your account does not have the <strong>dashboard_view</strong> permission.<br/>
+        Ask an Administrator to add you to a group with dashboard access (e.g. <em>Team</em> or <em>Leads</em>).</p>
+      </div>
+    );
+  }
+
+  // ΓöÇΓöÇ Manual cache refresh ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const handleRefreshNow = async () => {
+    setRefreshing(true);
+    try {
+      await axios.post(`${API}/api/cache/refresh`, {});
+      await fetchAll(false);
+    } catch { /* fetchAll shows error */ }
+    finally { setRefreshing(false); }
+  };
+
+  // ΓöÇΓöÇ Server selection helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const toggleSelect = (serverId, checked) => {
+    setSelectedIds(s => {
+      const n = new Set(s);
+      checked ? n.add(serverId) : n.delete(serverId);
+      return n;
+    });
+  };
+  const selectAll    = () => setSelectedIds(new Set(servers.map(s => s.server_id)));
+  const selectNone   = () => setSelectedIds(new Set());
+  const allSelected  = servers.length > 0 && selectedIds.size === servers.length;
+  const noneSelected = selectedIds.size === 0;
+
+  // ΓöÇΓöÇ Export selected servers to presentation CSV ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const handleExport = () => {
+    const selServers = servers.filter(s =>
+      selectedIds.size === 0 ? true : selectedIds.has(s.server_id)
+    );
+    const selVms = vms.filter(v =>
+      selectedIds.size === 0 ? true : selectedIds.has(v.host_server_id)
+    );
+    const csv = buildPresentationCsv(selServers, selVms);
+    const ts  = new Date().toISOString().slice(0, 16).replace("T", "_").replace(":", "");
+    const label = selectedIds.size > 0 ? `${selectedIds.size}servers` : "all";
+    triggerCsvDownload(csv, `hypermonitor_report_${label}_${ts}.csv`);
+  };
+
+  // ΓöÇΓöÇ Derived KPIs ΓÇö filtered VMs drive the counts when a filter is active ΓöÇΓöÇΓöÇΓöÇΓöÇ
+  const filteredVMs   = applyVMFilters(vms, filters);
+  const totalVMs      = (filters.serverId || filters.hypervisorType) ? filteredVMs.length : vms.length;
+  const runningVMs    = ((filters.serverId || filters.hypervisorType) ? filteredVMs : vms)
+                          .filter(v => v.power_state === "running").length;
+  const criticalCount = servers.filter(h => h.status === "critical").length;
+  const warningCount  = servers.filter(h => h.status === "warning").length;
+  const avgCpu        = servers.length
+    ? (servers.reduce((s, h) => s + h.cpu_usage_pct, 0) / servers.length).toFixed(1)
+    : 0;
+
+  // ΓöÇΓöÇ Loading ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  if (loading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-32 gap-4">
+        <svg className="animate-spin h-10 w-10 text-blue-500" viewBox="0 0 24 24" fill="none">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+        </svg>
+        <p className="text-slate-500 text-sm">Querying hypervisorsΓÇª</p>
+      </div>
+    );
+  }
+
+  // ΓöÇΓöÇ Error state (no servers loaded yet) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  if (error && servers.length === 0) {
+    const isPermError = error.startsWith("Permission denied");
+    return (
+      <div className={`rounded-xl border p-6 text-sm ${
+        isPermError
+          ? "bg-amber-50 border-amber-200 text-amber-800"
+          : "bg-red-50 border-red-200 text-red-700"
+      }`}>
+        <strong>{isPermError ? "Access denied:" : "Connection error:"}</strong> {error}
+        {isPermError && (
+          <p className="mt-3 text-xs text-amber-600">
+            Sign in as <strong>root</strong> ΓåÆ go to <strong>Users &amp; Groups</strong> ΓåÆ edit this user ΓåÆ assign the <strong>Team</strong>, <strong>Leads</strong>, or <strong>Administrator</strong> group.
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  // ΓöÇΓöÇ Empty state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  if (!loading && servers.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 gap-5 text-center px-6">
+        <svg className="w-20 h-20 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.1}
+                d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2
+                   M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2" />
+        </svg>
+        <div>
+          <p className="text-slate-700 font-bold text-xl">No servers to monitor yet</p>
+          <p className="text-slate-400 text-sm mt-1 max-w-sm">
+            Go to <strong>Manage Servers</strong> to add your first hypervisor host.
+          </p>
+        </div>
+        {onGoToServers && (
+          <button onClick={onGoToServers}
+                  className="mt-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold
+                    px-6 py-3 rounded-xl flex items-center gap-2">
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4"/>
+            </svg>
+            Go to Manage Servers
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-8">
+
+      {/* ΓöÇΓöÇ Page header ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-800">Server Overview</h1>
+          <p className="text-sm text-slate-400 flex items-center gap-2">
+            <span>Live data ┬╖ refreshes every {POLL_MS / 1000} s</span>
+            {lastUpdated && <span>┬╖ Updated {lastUpdated}</span>}
+            {fetching && (
+              <svg className="animate-spin h-3 w-3 text-blue-400" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+              </svg>
+            )}
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          {error && (
+            <span className="text-xs text-amber-600 bg-amber-50 border border-amber-200 px-3 py-1 rounded-full">
+              ΓÜá Fetch error ΓÇö showing last known data
+            </span>
+          )}
+
+          {/* Export Selected CSV */}
+          <button
+            onClick={handleExport}
+            disabled={servers.length === 0}
+            title={selectedIds.size > 0
+              ? `Export ${selectedIds.size} selected server(s) to CSV`
+              : "Export all servers to CSV"}
+            className="flex items-center gap-1.5 text-xs font-semibold
+              border border-indigo-400 text-indigo-700 px-3 py-1.5 rounded-lg
+              hover:bg-indigo-50 disabled:opacity-40 disabled:cursor-not-allowed">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            {selectedIds.size > 0 ? `Export ${selectedIds.size} Selected` : "Export All CSV"}
+          </button>
+
+          {/* Refresh Now */}
+          <button
+            disabled={refreshing || servers.length === 0}
+            onClick={handleRefreshNow}
+            className="flex items-center gap-1.5 text-xs font-semibold
+              border border-emerald-400 text-emerald-700 px-3 py-1.5 rounded-lg
+              hover:bg-emerald-50 disabled:opacity-40 disabled:cursor-not-allowed">
+            {refreshing
+              ? <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+                </svg>
+              : <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round"
+                        d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>}
+            {refreshing ? "RefreshingΓÇª" : "Refresh Now"}
+          </button>
+
+          {/* Send Report ΓÇö split button with format selector */}
+          <div className="flex items-center rounded-lg border border-slate-300 overflow-hidden divide-x divide-slate-300">
+            {/* Main action button */}
+            <button
+              disabled={sending || servers.length === 0}
+              onClick={async () => {
+                setSending(true); setSendMsg("");
+                try {
+                  const res = await axios.post(`${API}/api/email/send-report`,
+                    { report_format: sendFmt });
+                  setSendMsg(`Γ£ô ${res.data.message}`);
+                } catch (e) {
+                  const detail = e.response?.data?.detail || "Send failed. Check Email Reports settings.";
+                  setSendMsg(`ΓÜá ${detail}`);
+                } finally {
+                  setSending(false);
+                  setTimeout(() => setSendMsg(""), 7000);
+                }
+              }}
+              className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 px-3 py-1.5
+                hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed bg-white">
+              {sending
+                ? <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+                  </svg>
+                : <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round"
+                          d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                  </svg>}
+              {sending ? "SendingΓÇª" : "Send Report"}
+            </button>
+            {/* Format picker */}
+            <select
+              disabled={sending || servers.length === 0}
+              value={sendFmt}
+              onChange={e => setSendFmt(e.target.value)}
+              title="Select report format"
+              className="text-xs text-slate-500 bg-white px-2 py-1.5 appearance-none
+                focus:outline-none hover:bg-slate-50 disabled:opacity-40 cursor-pointer">
+              <option value="both">HTML+CSV</option>
+              <option value="html">HTML only</option>
+              <option value="csv">CSV only</option>
+            </select>
+          </div>
+
+          {onGoToEmail && (
+            <button onClick={onGoToEmail}
+                    className="flex items-center gap-1.5 text-xs font-semibold text-slate-500
+                      border border-slate-200 px-3 py-1.5 rounded-lg hover:bg-slate-50">
+              ΓÜÖ Email Settings
+            </button>
+          )}
+          {onGoToServers && (
+            <button onClick={onGoToServers}
+                    className="flex items-center gap-1.5 text-xs font-semibold text-blue-600
+                      border border-blue-300 px-3 py-1.5 rounded-lg hover:bg-blue-50">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4"/>
+              </svg>
+              Add Server
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Send report toast */}
+      {sendMsg && (
+        <div className={`text-sm px-4 py-2.5 rounded-xl border ${
+          sendMsg.startsWith("Γ£ô")
+            ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+            : "bg-amber-50 border-amber-200 text-amber-800"
+        }`}>
+          {sendMsg}
+        </div>
+      )}
+
+      {/* ΓöÇΓöÇ Critical alert banner ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+      {criticalCount > 0 && (
+        <div className="flex items-center gap-3 bg-red-50 border border-red-300 rounded-xl px-5 py-3 text-sm text-red-800">
+          <svg className="w-5 h-5 shrink-0 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+          </svg>
+          <div className="flex-1">
+            <span className="font-bold">Critical alert</span>
+            {" ΓÇö "}
+            {servers.filter(s => s.status === "critical").map(s => s.display_name).join(", ")}
+            {" "}{criticalCount === 1 ? "is" : "are"} at critical CPU utilisation (&gt;90%).
+            {servers.some(s => s.status === "critical" && s.error)
+              && " Connection errors detected ΓÇö check credentials."}
+          </div>
+        </div>
+      )}
+
+      {/* ΓöÇΓöÇ KPI strip ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+        <StatCard label="Total Hosts"  value={servers.length} sub="across all hypervisors" />
+        <StatCard label="Total VMs"    value={totalVMs}
+                  sub={`${runningVMs} running ┬╖ ${totalVMs - runningVMs} stopped`} />
+        <StatCard label="Avg CPU"      value={`${avgCpu}%`}
+                  sub="live across all hosts" accent="text-blue-600" />
+        <StatCard label="Alerts"
+                  value={criticalCount + warningCount}
+                  sub={`${criticalCount} critical ┬╖ ${warningCount} warning`}
+                  accent={criticalCount > 0 ? "text-red-600" : "text-amber-500"} />
+      </div>
+
+      {/* ΓöÇΓöÇ Req 2 ΓÇö Level 1 + Level 2 Composable Filter Dropdowns ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+      <section className="bg-white rounded-xl border border-slate-200 shadow-sm px-5 py-4">
+        <div className="flex flex-wrap items-end gap-4">
+          {/* Level 1 ΓÇö Hypervisor Type */}
+          <div className="flex flex-col gap-1 min-w-[180px]">
+            <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+              Level 1 ΓÇö Hypervisor
+            </label>
+            <select
+              value={filters.hypervisorType}
+              onChange={e => setHypervisorFilter(e.target.value)}
+              className="border border-slate-300 rounded-lg px-3 py-2 text-sm
+                focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white">
+              <option value="">All Hypervisors</option>
+              {hypervisors.map(hv => (
+                <option key={hv.name} value={hv.name}>
+                  {hv.name} ({hv.server_count} hosts ┬╖ {hv.vm_count} VMs)
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Level 2 ΓÇö Server (cascades from L1) */}
+          <div className="flex flex-col gap-1 min-w-[200px]">
+            <label className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+              Level 2 ΓÇö Server Host
+            </label>
+            <select
+              value={filters.serverId}
+              onChange={e => {
+                const sid = e.target.value;
+                const srv = l2Servers.find(s => s.server_id === sid);
+                setFilters(f => ({
+                  ...f,
+                  serverId:       sid,
+                  // Also pin hypervisorType so the filter is unambiguous
+                  hypervisorType: srv ? srv.hypervisor_type : f.hypervisorType,
+                  search:         "",
+                }));
+              }}
+              disabled={l2Servers.length === 0}
+              className="border border-slate-300 rounded-lg px-3 py-2 text-sm
+                focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white
+                disabled:opacity-50 disabled:cursor-not-allowed">
+              <option value="">
+                {l2Servers.length === 0
+                  ? "No servers available"
+                  : `All Servers (${l2Servers.length})`}
+              </option>
+              {l2Servers.map(s => (
+                <option key={s.server_id} value={s.server_id}>
+                  {s.display_name} ({s.ip_address})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Active filter pills + reset */}
+          <div className="flex flex-wrap gap-2 items-center ml-auto">
+            {filters.hypervisorType && (
+              <span className="inline-flex items-center gap-1 text-xs bg-blue-100 text-blue-700
+                border border-blue-200 px-2 py-0.5 rounded-full font-medium">
+                <HypervisorBadge type={filters.hypervisorType} />
+                <button onClick={() => setHypervisorFilter("")}
+                        className="ml-1 hover:text-blue-900">Γ£ò</button>
+              </span>
+            )}
+            {filters.serverId && (
+              <span className="inline-flex items-center gap-1 text-xs bg-slate-100
+                text-slate-700 border border-slate-200 px-2 py-1 rounded-full font-medium">
+                {l2Servers.find(s => s.server_id === filters.serverId)?.display_name
+                  || filters.serverId}
+                <button onClick={() => setFilters(f => ({ ...f, serverId: "" }))}
+                        className="ml-1 hover:text-slate-900">Γ£ò</button>
+              </span>
+            )}
+            {(filters.hypervisorType || filters.serverId ||
+              (filters.powerState && filters.powerState !== "all") ||
+              filters.search) && (
+              <button onClick={() => setFilters(EMPTY_FILTERS)}
+                      className="text-xs text-red-500 hover:text-red-700 underline font-semibold">
+                Reset all filters
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
+
+      {/* ΓöÇΓöÇ Hypervisor summary ΓÇö clickable filter cards ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+      {hypervisors.length > 0 && (
+        <section>
+          <h2 className="text-base font-semibold text-slate-700 mb-3">Hypervisor Summary</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            {hypervisors.map(hv => (
+              <button key={hv.name}
+                      onClick={() => setHypervisorFilter(
+                        filters.hypervisorType === hv.name ? "" : hv.name
+                      )}
+                      className={`text-left rounded-xl border p-4 transition-all ${
+                        filters.hypervisorType === hv.name
+                          ? "border-blue-400 bg-blue-50 shadow-sm"
+                          : "border-slate-200 bg-white hover:border-blue-300"
+                      }`}>
+                <div className="flex items-center justify-between mb-2">
+                  <HypervisorBadge type={hv.name} />
+                  <span className="text-xs text-slate-400">{hv.server_count} hosts</span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                  <span className="text-slate-500">VMs</span>
+                  <span className="font-semibold text-slate-700">{hv.vm_count}</span>
+                  <span className="text-slate-500">Avg CPU</span>
+                  <span className="font-semibold text-slate-700">{hv.avg_cpu_pct}%</span>
+                  <span className="text-slate-500">Avg RAM</span>
+                  <span className="font-semibold text-slate-700">{hv.avg_ram_pct}%</span>
+                </div>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* ΓöÇΓöÇ Server cards ΓÇö selectable for export ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+      <section>
+        <div className="flex items-center gap-3 mb-3">
+          <h2 className="text-base font-semibold text-slate-700">Live Host Utilisation</h2>
+          <div className="flex gap-2 text-xs ml-auto">
+            <button onClick={allSelected ? selectNone : selectAll}
+                    className="text-slate-400 hover:text-slate-700 underline">
+              {allSelected ? "Deselect all" : "Select all"}
+            </button>
+            {!noneSelected && !allSelected && (
+              <button onClick={selectNone}
+                      className="text-slate-400 hover:text-slate-700 underline">
+                Clear
+              </button>
+            )}
+            {selectedIds.size > 0 && (
+              <span className="text-indigo-600 font-semibold">
+                {selectedIds.size} selected
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+          {servers
+            .filter(s =>
+              (!filters.hypervisorType || s.hypervisor_type === filters.hypervisorType)
+            )
+            .map(s => (
+              <ServerCard
+                key={s.server_id}
+                server={s}
+                selected={selectedIds.has(s.server_id)}
+                onSelect={toggleSelect}
+                isFilterActive={filters.serverId === s.server_id}
+                onCardClick={() => handleServerCardClick(s)}
+              />
+            ))}
+        </div>
+
+        {selectedIds.size > 0 && (
+          <p className="mt-3 text-xs text-indigo-600 flex items-center gap-1">
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round"
+                    d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+            </svg>
+            {selectedIds.size} server{selectedIds.size > 1 ? "s" : ""} selected ΓÇö
+            click <strong>Export {selectedIds.size} Selected</strong> in the header to download a presentation-ready CSV.
+          </p>
+        )}
+      </section>
+
+      {/* ΓöÇΓöÇ VM inventory ΓÇö centralized filter state drives everything ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ */}
+      <section>
+        <VMTable
+          vms={vms}
+          filters={filters}
+          onFilters={setFilters}
+          onVmsUpdated={() => fetchAll(true)}
+          servers={servers}
+          snapCounts={snapCounts}
+          onSnapCount={handleSnapCount}
+        />
+      </section>
+
+    </div>
+  );
+}
