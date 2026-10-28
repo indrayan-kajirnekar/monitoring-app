@@ -40,10 +40,12 @@ function _textMatch(text, query) {
 
 function applyVMFilters(vms, { hypervisorType, serverId, powerState, search }) {
   return vms.filter(vm => {
-    // Server / hypervisor dropdown filters — exact match, unchanged
+    // Apply serverId and hypervisorType as independent filters so that selecting
+    // a specific server card (which sets BOTH) correctly narrows by host AND type.
     if (serverId) {
       if (String(vm.host_server_id) !== String(serverId)) return false;
-    } else if (hypervisorType) {
+    }
+    if (hypervisorType) {
       if (vm.hypervisor_type !== hypervisorType) return false;
     }
 
